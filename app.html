@@ -82,7 +82,7 @@
   }
 
   function bootstrapWeek(){
-    const today = new Date().toISOString().slice(0,10);
+    const today = todayIsoLocal();
     google.script.run
       .withSuccessHandler(res => {
         state.week = { weekStart: res.weekStart, weekEnd: res.weekEnd, items: res.items, totals: res.totals };
@@ -93,9 +93,10 @@
   }
 
   function bootstrapStats(){
-    const today = new Date().toISOString().slice(0,10);
-    const from = new Date(); from.setDate(from.getDate()-30);
-    const dateFrom = from.toISOString().slice(0,10);
+     const today = todayIsoLocal();
+    const from = new Date();
+    from.setDate(from.getDate()-30);
+    const dateFrom = localDateISO(from);
 
     google.script.run
       .withSuccessHandler(res => {
@@ -120,7 +121,7 @@
    * View: Today
    * ------------------------*/
   function renderToday(){
-    const root = el('view-today');
+    const todayISO = todayIsoLocal();
     const todayISO = new Date().toISOString().slice(0,10);
 
     const todayItems = state.rolling.items.filter(it => it.Date === todayISO);
@@ -597,6 +598,18 @@
     if (ak) parts.push(`${fmt1(ak)} km`);
     if (am) parts.push(`${fmt0(am)} min`);
     return `${log.Status}: ${parts.join(' • ') || '—'}`;
+  }
+
+
+  function localDateISO(d){
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function todayIsoLocal(){
+    return localDateISO(new Date());
   }
 
   function fmt1(n){
