@@ -182,6 +182,25 @@ function apiComputeStats(args) {
 
   const streakAllPlanned = computeStreakFrom_(allPlanned);
 
+// Distance summaries
+  const yearStart = `${dateTo.slice(0, 4)}-01-01`;
+  const monthStart = `${dateTo.slice(0, 7)}-01`;
+  const kmRows = readPlanBetween_(yearStart, dateTo, tz);
+  ensurePlanIds_(kmRows);
+  const kmPlanIds = kmRows.map(r => r.PlanID).filter(Boolean);
+  const kmLogMap = readLogsByPlanId_(kmPlanIds);
+
+  let yearDoneKm = 0;
+  let monthDoneKm = 0;
+  kmRows.forEach(p => {
+    const log = kmLogMap[p.PlanID];
+    if (!log) return;
+    if (!['DONE', 'PARTIAL'].includes(log.Status)) return;
+    const km = coerceNumber_(log.ActualKm);
+    yearDoneKm += km;
+    if (p.Date >= monthStart) monthDoneKm += km;
+  });
+
   return {
     settings,
     dateFrom,
@@ -189,6 +208,10 @@ function apiComputeStats(args) {
     streaks: {
       allPlannedCompleted: streakAllPlanned,
       didSomething: streakDidSomething
+       },
+    kmSummary: {
+      monthDoneKm,
+      yearDoneKm
     }
   };
 }
