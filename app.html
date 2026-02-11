@@ -4,6 +4,7 @@
     rolling: { dateFrom: null, dateTo: null, items: [] },
     week: { weekStart: null, weekEnd: null, items: [], totals: null },
     stats: null,
+       weekAnchorDate: null,
     currentView: 'today',
     modal: { open: false, item: null }
   };
@@ -81,15 +82,23 @@
       .apiBootstrap({});
   }
 
-  function bootstrapWeek(){
-    const today = todayIsoLocal();
+  function bootstrapWeek(anchorDate){
+    const anchor = anchorDate || state.weekAnchorDate || todayIsoLocal();
     google.script.run
       .withSuccessHandler(res => {
         state.week = { weekStart: res.weekStart, weekEnd: res.weekEnd, items: res.items, totals: res.totals };
+        state.weekAnchorDate = res.weekStart || anchor;
         if (state.currentView === 'plan' || state.currentView === 'today') renderActive();
       })
       .withFailureHandler(err => console.error(err))
-      .apiComputeWeek({ anchorDate: today });
+      .apiComputeWeek({ anchorDate: anchor });
+  }
+
+  function changeWeek(offset){
+    const base = state.week?.weekStart || todayIsoLocal();
+    const d = new Date(base + 'T00:00:00');
+    d.setDate(d.getDate() + (Number(offset) * 7));
+    bootstrapWeek(localDateISO(d));
   }
 
   function bootstrapStats(){
@@ -121,8 +130,8 @@
    * View: Today
    * ------------------------*/
   function renderToday(){
+     const root = el('view-today');
     const todayISO = todayIsoLocal();
-    const todayISO = new Date().toISOString().slice(0,10);
 
     const todayItems = state.rolling.items.filter(it => it.Date === todayISO);
     const nextItems = state.rolling.items
@@ -140,7 +149,7 @@
       <div class="hero">
         <div class="hero-top">
           <div>
-            <div class="hero-title">Today</div>
+            <div class="hero-title">Week</div>
             <div class="hero-sub">${todayISO} • ${todayItems.length} session(s)</div>
           </div>
           <div class="hero-sub">${state.week?.weekStart ? `Week ${state.week.weekStart} → ${state.week.weekEnd}` : ''}</div>
@@ -159,7 +168,7 @@
       ${renderSessionCardBlock(todayItems, true)}
 
       <div class="section-title">Up next</div>
-      ${renderSessionCardBlock(nextItems, false)}
+      ${renderSessionCardBlock(nextItems, false, true)}
 
       <div class="section-title">Add run</div>
       <div class="tile-grid">
@@ -215,7 +224,6 @@
     const items = state.week?.items?.length ? state.week.items : state.rolling.items;
     const grouped = groupByDateSlot(items);
 
-    // Build a single current-week card (v1). Later we can add prev/next week.
     const totals = state.week?.totals || computeTotalsClient(items);
     const plannedCount = items.length;
     const doneCount = items.filter(it => it.Log && (it.Log.Status === 'DONE' || it.Log.Status === 'PARTIAL')).length;
@@ -224,14 +232,17 @@
     const weekLabel = state.week?.weekStart ? `${state.week.weekStart} → ${state.week.weekEnd}` : 'This period';
 
     root.innerHTML = `
-      <div class="week-card" data-collapsible="week1" data-open="true">
+       <div class="week-card">
         <div class="week-top">
           <div>
             <div class="week-title">Plan</div>
             <div class="week-meta">${weekLabel} • ${doneCount}/${plannedCount} done • ${fmt1(totals.plannedKm)} km planned</div>
             <div class="bar"><div style="width:${pct}%"></div></div>
           </div>
-          <button class="week-toggle" data-toggle="week1">⌄</button>
+             <div style="display:flex; gap:8px; align-items:center;">
+            <button class="week-toggle" data-action="prev-week" aria-label="Previous week">‹</button>
+            <button class="week-toggle" data-action="next-week" aria-label="Next week">›</button>
+          </div>
         </div>
 
         <div class="card" id="week1Body" style="margin-top:12px;">
@@ -239,7 +250,7 @@
             const day = grouped[dateISO];
             return `
               <div class="card-pad" style="padding-bottom:0;">
-                <div class="section-title" style="margin:0 0 8px 0;">${dateISO}</div>
+                <div class="section-title" style="margin:0 0 8px 0;">${formatDateWithDay(dateISO)}</div>
               </div>
               ${renderSlotList(dateISO, 'AM', day.AM)}
               ${renderSlotList(dateISO, 'PM', day.PM)}
@@ -250,7 +261,8 @@
     `;
 
     wireSessions(root);
-    wireWeekToggle(root);
+    root.querySelector('[data-action="prev-week"]')?.addEventListener('click', () => changeWeek(-1));
+    root.querySelector('[data-action="next-week"]')?.addEventListener('click', () => changeWeek(1));
   }
 
   function renderSlotList(dateISO, slot, items){
@@ -260,19 +272,10 @@
       <div class="card-pad" style="padding-top:6px; padding-bottom:6px; border-top:1px solid rgba(255,255,255,.06);">
         <div class="section-title" style="margin:0; font-size:12px;">${slot}</div>
       </div>
-      ${items.map(it => renderSessionRow(it)).join('')}
+       ${items.map(it => renderSessionRow(it, false)).join('')}
     `;
   }
 
-  function wireWeekToggle(root){
-    const btn = root.querySelector('[data-toggle="week1"]');
-    if (!btn) return;
-    btn.addEventListener('click', () => {
-      const body = el('week1Body');
-      const isHidden = body.classList.toggle('hidden');
-      btn.textContent = isHidden ? '›' : '⌄';
-    });
-  }
 
   /** -------------------------
    * View: Activities (completed feed)
@@ -329,9 +332,16 @@
 
           <div style="height:10px;"></div>
 
-          <div class="hero-sub">
-            Next: we can add sport breakdowns + monthly totals and a “challenge floor” checker here.
-          </div>
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Km this month</div>
+              <div class="v">${fmt1(res?.kmSummary?.monthDoneKm || 0)}</div>
+            </div>
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Km this year</div>
+              <div class="v">${fmt1(res?.kmSummary?.yearDoneKm || 0)}</div>
+      </div>
+      </div>
         </div>
       </div>
     `;
@@ -340,13 +350,13 @@
   /** -------------------------
    * Session rendering
    * ------------------------*/
-  function renderSessionCardBlock(items, showEmpty){
+  function renderSessionCardBlock(items, showEmpty, showDate){
     if (!items || !items.length){
       return showEmpty ? `<div class="card"><div class="card-pad"><div class="hero-sub">No sessions.</div></div></div>` : '';
     }
     return `
       <div class="card">
-        ${items.map(it => renderSessionRow(it)).join('')}
+          ${items.map(it => renderSessionRow(it, showDate)).join('')}
       </div>
     `;
   }
@@ -363,7 +373,7 @@
       ? `<button class="btn ghost" data-action="edit" data-planid="${esc(it.PlanID)}">Edit</button>`
       : `<button class="btn primary" data-action="done" data-planid="${esc(it.PlanID)}">Done</button>`;
 
-    const dateLine = showDate ? `${it.Date} • ` : '';
+    const dateLine = showDate ? `${formatDateWithDay(it.Date)} • ` : '';
     const sub = `${dateLine}${it.Slot || ''} • ${it.Sport || 'Other'} • ${planned}${it.RPE ? ` • RPE ${esc(String(it.RPE))}` : ''}`;
 
     return `
@@ -610,6 +620,13 @@
 
   function todayIsoLocal(){
     return localDateISO(new Date());
+  }
+
+function formatDateWithDay(dateISO){
+    if (!dateISO) return '';
+    const d = new Date(dateISO + 'T00:00:00');
+    const day = d.toLocaleDateString('en-US', { weekday: 'short' });
+    return `${day} ${dateISO}`;
   }
 
   function fmt1(n){
