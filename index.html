@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <?!= include('styles'); ?>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-title">Training Planner</div>
+        <div class="brand-sub" id="subTitle">Loading…</div>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="Views">
+        <button class="tab active" data-view="rolling" role="tab">Rolling</button>
+        <button class="tab" data-view="week" role="tab">Week</button>
+        <button class="tab" data-view="stats" role="tab">Stats</button>
+      </nav>
+    </header>
+
+    <main class="container">
+      <!-- Rolling -->
+      <section id="view-rolling" class="view"></section>
+
+      <!-- Week -->
+      <section id="view-week" class="view hidden"></section>
+
+      <!-- Stats -->
+      <section id="view-stats" class="view hidden"></section>
+    </main>
+
+    <!-- Modal -->
+    <div id="modalOverlay" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-header">
+          <div>
+            <div id="modalTitle" class="modal-title">Edit session</div>
+            <div id="modalMeta" class="modal-meta"></div>
+          </div>
+          <button class="icon-btn" id="modalCloseBtn" aria-label="Close">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <label class="field">
+            <span>Status</span>
+            <select id="editStatus">
+              <option value="DONE">Done</option>
+              <option value="PARTIAL">Partial</option>
+              <option value="SKIPPED">Skipped</option>
+            </select>
+          </label>
+
+          <div class="row">
+            <label class="field">
+              <span>Actual km</span>
+              <input id="editKm" type="number" inputmode="decimal" step="0.1" />
+            </label>
+
+            <label class="field">
+              <span>Actual min</span>
+              <input id="editMin" type="number" inputmode="numeric" step="1" />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Notes</span>
+            <textarea id="editNotes" rows="3" placeholder="Optional…"></textarea>
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <button class="btn ghost" id="modalCancelBtn">Cancel</button>
+          <button class="btn primary" id="modalSaveBtn">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <?!= include('app'); ?>
+  </body>
+</html>
