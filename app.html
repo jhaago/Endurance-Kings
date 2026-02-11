@@ -1,50 +1,52 @@
 <script>
-  // Server-injected config (from doGet template)
-  const APP_CONFIG = <?= JSON.stringify(appConfig) ?>;
-
   const state = {
     settings: null,
     rolling: { dateFrom: null, dateTo: null, items: [] },
     week: { weekStart: null, weekEnd: null, items: [], totals: null },
-    currentView: 'rolling',
+    stats: null,
+    currentView: 'today',
     modal: { open: false, item: null }
   };
 
   const el = (id) => document.getElementById(id);
 
-  function init() {
-    wireTabs();
+  function init(){
+    wireBottomNav();
     wireModal();
-    bootstrapRolling();
+    wireTopbar();
+    bootstrapAll();
   }
 
-  function wireTabs() {
-    document.querySelectorAll('.tab').forEach(btn => {
+  function wireTopbar(){
+    el('refreshBtn').addEventListener('click', () => bootstrapAll(true));
+  }
+
+  function wireBottomNav(){
+    document.querySelectorAll('.nav-item').forEach(btn => {
       btn.addEventListener('click', () => switchView(btn.dataset.view));
     });
   }
 
-  function switchView(view) {
+  function switchView(view){
     state.currentView = view;
-    document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-    el('view-rolling').classList.toggle('hidden', view !== 'rolling');
-    el('view-week').classList.toggle('hidden', view !== 'week');
+
+    document.querySelectorAll('.nav-item').forEach(b => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
+
+    el('view-today').classList.toggle('hidden', view !== 'today');
+    el('view-plan').classList.toggle('hidden', view !== 'plan');
+    el('view-activities').classList.toggle('hidden', view !== 'activities');
     el('view-stats').classList.toggle('hidden', view !== 'stats');
 
-    if (view === 'rolling') {
-      renderRolling();
-    } else if (view === 'week') {
-      bootstrapWeek();
-    } else if (view === 'stats') {
-      bootstrapStats();
-    }
+    renderActive();
   }
 
-  function setSubtitle(text) {
+  function setSubtitle(text){
     el('subTitle').textContent = text;
   }
 
-  function toast(msg) {
+  function toast(msg){
     const t = el('toast');
     t.textContent = msg;
     t.classList.remove('hidden');
@@ -54,245 +56,388 @@
   /** -------------------------
    * Bootstrap
    * ------------------------*/
-  function bootstrapRolling() {
-    setSubtitle('Loading rolling plan…');
+  async function bootstrapAll(force){
+    setSubtitle('Loading…');
+
+    // Load rolling first (drives Today + Plan)
     google.script.run
       .withSuccessHandler(res => {
         state.settings = res.settings;
         state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
-        setSubtitle(`Rolling: ${res.dateFrom} → ${res.dateTo}`);
-        renderRolling();
+
+        setSubtitle(`Next ${Number(res.settings?.RollingDays || 7)} days`);
+
+        // Load week + stats in background (non-blocking)
+        bootstrapWeek();
+        bootstrapStats();
+
+        renderActive();
       })
       .withFailureHandler(err => {
         console.error(err);
-        setSubtitle('Failed to load');
+        setSubtitle('Load failed');
         toast('Load failed');
       })
       .apiBootstrap({});
   }
 
-  function bootstrapWeek() {
-    setSubtitle('Loading week…');
+  function bootstrapWeek(){
     const today = new Date().toISOString().slice(0,10);
     google.script.run
       .withSuccessHandler(res => {
         state.week = { weekStart: res.weekStart, weekEnd: res.weekEnd, items: res.items, totals: res.totals };
-        setSubtitle(`Week: ${res.weekStart} → ${res.weekEnd}`);
-        renderWeek();
+        if (state.currentView === 'plan' || state.currentView === 'today') renderActive();
       })
-      .withFailureHandler(err => {
-        console.error(err);
-        toast('Week load failed');
-      })
+      .withFailureHandler(err => console.error(err))
       .apiComputeWeek({ anchorDate: today });
   }
 
-  function bootstrapStats() {
-    setSubtitle('Loading stats…');
+  function bootstrapStats(){
     const today = new Date().toISOString().slice(0,10);
-    const from = new Date();
-    from.setDate(from.getDate() - 30);
+    const from = new Date(); from.setDate(from.getDate()-30);
     const dateFrom = from.toISOString().slice(0,10);
 
     google.script.run
       .withSuccessHandler(res => {
-        setSubtitle(`Stats: last 30 days`);
-        renderStats(res);
+        state.stats = res;
+        if (state.currentView === 'stats' || state.currentView === 'today') renderActive();
       })
-      .withFailureHandler(err => {
-        console.error(err);
-        toast('Stats load failed');
-      })
+      .withFailureHandler(err => console.error(err))
       .apiComputeStats({ dateFrom, dateTo: today });
   }
 
   /** -------------------------
-   * Rendering
+   * Render dispatcher
    * ------------------------*/
-  function renderRolling() {
-    const root = el('view-rolling');
-    const grouped = groupByDateSlot(state.rolling.items);
-
-    root.innerHTML = Object.keys(grouped).sort().map(dateISO => {
-      const day = grouped[dateISO];
-      return `
-        <div class="day">
-          <div class="day-header">
-            <div>
-              <div class="day-title">${dateISO}</div>
-              <div class="day-sub">${day.count} session(s)</div>
-            </div>
-          </div>
-
-          ${renderSlot(dateISO, 'AM', day.AM)}
-          ${renderSlot(dateISO, 'PM', day.PM)}
-        </div>
-      `;
-    }).join('') || `<div class="day"><div class="day-title">No sessions found</div></div>`;
-
-    // wire buttons after render
-    wireCards(root);
+  function renderActive(){
+    if (state.currentView === 'today') renderToday();
+    if (state.currentView === 'plan') renderPlan();
+    if (state.currentView === 'activities') renderActivities();
+    if (state.currentView === 'stats') renderStats();
   }
 
-  function renderWeek() {
-    const root = el('view-week');
-    const totals = state.week.totals || { plannedKm:0, plannedMin:0, doneKm:0, doneMin:0, bySport:{} };
+  /** -------------------------
+   * View: Today
+   * ------------------------*/
+  function renderToday(){
+    const root = el('view-today');
+    const todayISO = new Date().toISOString().slice(0,10);
 
-    const kpis = `
-      <div class="totals">
-        <div class="kpi"><div class="k">Planned km</div><div class="v">${fmt1(totals.plannedKm)}</div></div>
-        <div class="kpi"><div class="k">Done km</div><div class="v">${fmt1(totals.doneKm)}</div></div>
-        <div class="kpi"><div class="k">Planned min</div><div class="v">${fmt0(totals.plannedMin)}</div></div>
-        <div class="kpi"><div class="k">Done min</div><div class="v">${fmt0(totals.doneMin)}</div></div>
-      </div>
-    `;
+    const todayItems = state.rolling.items.filter(it => it.Date === todayISO);
+    const nextItems = state.rolling.items
+      .filter(it => it.Date > todayISO)
+      .sort((a,b) => (a.Date.localeCompare(b.Date) || (a.Slot||'').localeCompare(b.Slot||'')))
+      .slice(0, 6);
 
-    const grouped = groupByDateSlot(state.week.items);
+    // Week progress (if week data loaded)
+    const wk = state.week?.items || [];
+    const wkPlanned = wk.length;
+    const wkDone = wk.filter(it => it.Log && (it.Log.Status === 'DONE' || it.Log.Status === 'PARTIAL')).length;
+    const pct = wkPlanned ? Math.round((wkDone / wkPlanned) * 100) : 0;
 
     root.innerHTML = `
-      ${kpis}
-      ${Object.keys(grouped).sort().map(dateISO => {
-        const day = grouped[dateISO];
-        return `
-          <div class="day">
-            <div class="day-header">
-              <div>
-                <div class="day-title">${dateISO}</div>
-                <div class="day-sub">${day.count} session(s)</div>
+      <div class="hero">
+        <div class="hero-top">
+          <div>
+            <div class="hero-title">Today</div>
+            <div class="hero-sub">${todayISO} • ${todayItems.length} session(s)</div>
+          </div>
+          <div class="hero-sub">${state.week?.weekStart ? `Week ${state.week.weekStart} → ${state.week.weekEnd}` : ''}</div>
+        </div>
+
+        <div class="bar"><div style="width:${pct}%"></div></div>
+
+        <div class="hero-kpis">
+          <div class="kpi"><div class="k">Week progress</div><div class="v">${wkDone}/${wkPlanned || 0}</div></div>
+          <div class="kpi"><div class="k">Planned km (week)</div><div class="v">${fmt1(state.week?.totals?.plannedKm || 0)}</div></div>
+          <div class="kpi"><div class="k">Done km (week)</div><div class="v">${fmt1(state.week?.totals?.doneKm || 0)}</div></div>
+        </div>
+      </div>
+
+      <div class="section-title">Today sessions</div>
+      ${renderSessionCardBlock(todayItems, true)}
+
+      <div class="section-title">Up next</div>
+      ${renderSessionCardBlock(nextItems, false)}
+
+      <div class="section-title">Add run</div>
+      <div class="tile-grid">
+        <div class="tile easy" data-add="easy"><small>Run</small>Easy</div>
+        <div class="tile tempo" data-add="tempo"><small>Run</small>Tempo</div>
+        <div class="tile intervals" data-add="intervals"><small>Run</small>Intervals</div>
+        <div class="tile hills" data-add="hills"><small>Run</small>Hills</div>
+        <div class="tile long" data-add="long"><small>Run</small>Long</div>
+        <div class="tile race" data-add="race"><small>Run</small>Race</div>
+      </div>
+
+      <div class="section-title">Streaks</div>
+      ${renderStreakMini()}
+    `;
+
+    wireSessions(root);
+    wireAddTiles(root);
+  }
+
+  function renderStreakMini(){
+    const s = state.stats;
+    const a = s?.streaks?.allPlannedCompleted ?? 0;
+    const b = s?.streaks?.didSomething ?? 0;
+    const allowance = Number(s?.settings?.PartialAllowancePerWeek ?? 1);
+
+    return `
+      <div class="card">
+        <div class="card-pad">
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 200px;">
+              <div class="k">All planned completed</div>
+              <div class="v">${a}</div>
+              <div class="hero-sub">Allows ${allowance} partial/week</div>
+            </div>
+            <div class="kpi" style="flex:1 1 200px;">
+              <div class="k">Did something</div>
+              <div class="v">${b}</div>
+              <div class="hero-sub">Any done/partial</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  /** -------------------------
+   * View: Plan (Week blocks)
+   * ------------------------*/
+  function renderPlan(){
+    const root = el('view-plan');
+
+    // Use week items if loaded, else fallback to rolling
+    const items = state.week?.items?.length ? state.week.items : state.rolling.items;
+    const grouped = groupByDateSlot(items);
+
+    // Build a single current-week card (v1). Later we can add prev/next week.
+    const totals = state.week?.totals || computeTotalsClient(items);
+    const plannedCount = items.length;
+    const doneCount = items.filter(it => it.Log && (it.Log.Status === 'DONE' || it.Log.Status === 'PARTIAL')).length;
+    const pct = plannedCount ? Math.round((doneCount/plannedCount)*100) : 0;
+
+    const weekLabel = state.week?.weekStart ? `${state.week.weekStart} → ${state.week.weekEnd}` : 'This period';
+
+    root.innerHTML = `
+      <div class="week-card" data-collapsible="week1" data-open="true">
+        <div class="week-top">
+          <div>
+            <div class="week-title">Plan</div>
+            <div class="week-meta">${weekLabel} • ${doneCount}/${plannedCount} done • ${fmt1(totals.plannedKm)} km planned</div>
+            <div class="bar"><div style="width:${pct}%"></div></div>
+          </div>
+          <button class="week-toggle" data-toggle="week1">⌄</button>
+        </div>
+
+        <div class="card" id="week1Body" style="margin-top:12px;">
+          ${Object.keys(grouped).sort().map(dateISO => {
+            const day = grouped[dateISO];
+            return `
+              <div class="card-pad" style="padding-bottom:0;">
+                <div class="section-title" style="margin:0 0 8px 0;">${dateISO}</div>
               </div>
-            </div>
-            ${renderSlot(dateISO, 'AM', day.AM)}
-            ${renderSlot(dateISO, 'PM', day.PM)}
-          </div>
-        `;
-      }).join('')}
+              ${renderSlotList(dateISO, 'AM', day.AM)}
+              ${renderSlotList(dateISO, 'PM', day.PM)}
+            `;
+          }).join('')}
+        </div>
+      </div>
     `;
 
-    wireCards(root);
+    wireSessions(root);
+    wireWeekToggle(root);
   }
 
-  function renderStats(res) {
-    const root = el('view-stats');
-    const s1 = res.streaks?.allPlannedCompleted ?? 0;
-    const s2 = res.streaks?.didSomething ?? 0;
-    const allowance = Number(res.settings?.PartialAllowancePerWeek ?? 1);
+  function renderSlotList(dateISO, slot, items){
+    items = items || [];
+    if (!items.length) return '';
+    return `
+      <div class="card-pad" style="padding-top:6px; padding-bottom:6px; border-top:1px solid rgba(255,255,255,.06);">
+        <div class="section-title" style="margin:0; font-size:12px;">${slot}</div>
+      </div>
+      ${items.map(it => renderSessionRow(it)).join('')}
+    `;
+  }
+
+  function wireWeekToggle(root){
+    const btn = root.querySelector('[data-toggle="week1"]');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      const body = el('week1Body');
+      const isHidden = body.classList.toggle('hidden');
+      btn.textContent = isHidden ? '›' : '⌄';
+    });
+  }
+
+  /** -------------------------
+   * View: Activities (completed feed)
+   * ------------------------*/
+  function renderActivities(){
+    const root = el('view-activities');
+
+    // Activities = any item with log status DONE/PARTIAL/SKIPPED
+    const all = state.rolling.items.slice();
+    const done = all
+      .filter(it => it.Log && it.Log.Status && it.Log.Status !== 'PLANNED')
+      .sort((a,b) => (b.Date.localeCompare(a.Date)));
 
     root.innerHTML = `
-      <div class="totals">
-        <div class="kpi">
-          <div class="k">Streak: All planned completed</div>
-          <div class="v">${s1}</div>
-          <div class="day-sub">Allows ${allowance} partial per week</div>
-        </div>
-        <div class="kpi">
-          <div class="k">Streak: Did something</div>
-          <div class="v">${s2}</div>
-          <div class="day-sub">Any done/partial w/ actuals</div>
-        </div>
+      <div class="section-title">Activities</div>
+      <div class="card">
+        ${done.length ? done.map(it => renderSessionRow(it, true)).join('') :
+          `<div class="card-pad"><div class="hero-sub">No completed sessions yet. Mark something done.</div></div>`
+        }
       </div>
+    `;
 
-      <div class="day">
-        <div class="day-title">Next steps</div>
-        <div class="day-sub">We can add sport breakdowns, monthly totals, and a challenge-floor tracker in v1.1</div>
+    wireSessions(root);
+  }
+
+  /** -------------------------
+   * View: Stats (full)
+   * ------------------------*/
+  function renderStats(){
+    const root = el('view-stats');
+    const res = state.stats;
+
+    const s1 = res?.streaks?.allPlannedCompleted ?? 0;
+    const s2 = res?.streaks?.didSomething ?? 0;
+    const allowance = Number(res?.settings?.PartialAllowancePerWeek ?? 1);
+
+    root.innerHTML = `
+      <div class="section-title">Stats</div>
+
+      <div class="card">
+        <div class="card-pad">
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Streak: all planned</div>
+              <div class="v">${s1}</div>
+              <div class="hero-sub">Allows ${allowance} partial/week</div>
+            </div>
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Streak: did something</div>
+              <div class="v">${s2}</div>
+              <div class="hero-sub">Any done/partial with actuals</div>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+          <div class="hero-sub">
+            Next: we can add sport breakdowns + monthly totals and a “challenge floor” checker here.
+          </div>
+        </div>
       </div>
     `;
   }
 
-  function renderSlot(dateISO, slot, items) {
-    items = items || [];
+  /** -------------------------
+   * Session rendering
+   * ------------------------*/
+  function renderSessionCardBlock(items, showEmpty){
+    if (!items || !items.length){
+      return showEmpty ? `<div class="card"><div class="card-pad"><div class="hero-sub">No sessions.</div></div></div>` : '';
+    }
     return `
-      <div class="slot">
-        <div class="slot-title">
-          <div>${slot}</div>
-          <div class="day-sub">${items.length} item(s)</div>
-        </div>
-        ${items.map(it => renderCard(it)).join('') || `<div class="day-sub">No sessions</div>`}
+      <div class="card">
+        ${items.map(it => renderSessionRow(it)).join('')}
       </div>
     `;
   }
 
-  function renderCard(it) {
-    const log = it.Log;
-    const status = (log && log.Status) ? log.Status : 'PLANNED';
+  function renderSessionRow(it, showDate){
+    const log = it.Log || null;
+    const status = log?.Status || 'PLANNED';
 
-    const dotClass =
-      status === 'DONE' ? 'status-done' :
-      status === 'PARTIAL' ? 'status-partial' :
-      status === 'SKIPPED' ? 'status-skipped' : '';
-
+    const color = workoutColor(it);
     const planned = plannedText(it);
-    const actionLabel = (status === 'DONE' || status === 'PARTIAL' || status === 'SKIPPED') ? 'Edit' : 'Done';
-    const actionClass = (actionLabel === 'Done') ? 'primary' : 'ghost';
+    const actual = log ? actualText(log) : '';
+
+    const rightBtn = (status === 'DONE' || status === 'PARTIAL' || status === 'SKIPPED')
+      ? `<button class="btn ghost" data-action="edit" data-planid="${esc(it.PlanID)}">Edit</button>`
+      : `<button class="btn primary" data-action="done" data-planid="${esc(it.PlanID)}">Done</button>`;
+
+    const dateLine = showDate ? `${it.Date} • ` : '';
+    const sub = `${dateLine}${it.Slot || ''} • ${it.Sport || 'Other'} • ${planned}${it.RPE ? ` • RPE ${esc(String(it.RPE))}` : ''}`;
 
     return `
-      <div class="card" data-planid="${esc(it.PlanID)}">
-        <div class="pill">
-          <span class="statusDot ${dotClass}"></span>
-          ${esc(it.Sport || 'Other')}
+      <div class="session" data-planid="${esc(it.PlanID)}">
+        <div class="dot" style="background:${color};"></div>
+        <div class="session-main">
+          <div class="session-title">${esc(it.Title || '(Untitled)')}</div>
+          <div class="session-sub">${esc(sub)}</div>
+          ${it.Notes ? `<div class="session-note">${esc(it.Notes)}</div>` : ''}
+          ${actual ? `<div class="session-note">Actual: ${esc(actual)}</div>` : ''}
         </div>
-
-        <div class="meta">
-          <div class="title">${esc(it.Title || '(Untitled)')}</div>
-          <div class="sub">${planned}${it.RPE ? ` • RPE ${esc(String(it.RPE))}` : ''}</div>
-          ${it.Notes ? `<div class="note trunc">${esc(it.Notes)}</div>` : ''}
-          ${log ? `<div class="note">Actual: ${actualText(log)}</div>` : ''}
-        </div>
-
-        <div class="actions">
-          <button class="btn ${actionClass}" data-action="${actionLabel.toLowerCase()}" data-planid="${esc(it.PlanID)}">${actionLabel}</button>
+        <div class="session-actions">
+          ${rightBtn}
         </div>
       </div>
     `;
   }
 
-  function wireCards(root) {
+  function wireSessions(root){
+    // done buttons
     root.querySelectorAll('button[data-action="done"]').forEach(btn => {
       btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const planId = e.currentTarget.dataset.planid;
         e.currentTarget.disabled = true;
-        try {
+        try{
           const log = await callApiSetDone(planId);
           patchItemLog(planId, log);
           toast('Marked done');
-          rerenderActive();
-        } catch (err) {
+          bootstrapWeek();   // refresh totals
+          bootstrapStats();  // refresh streaks
+          renderActive();
+        }catch(err){
           console.error(err);
           toast('Failed');
-        } finally {
+        }finally{
           e.currentTarget.disabled = false;
         }
       });
     });
 
+    // edit buttons
     root.querySelectorAll('button[data-action="edit"]').forEach(btn => {
       btn.addEventListener('click', (e) => {
+        e.stopPropagation();
         const planId = e.currentTarget.dataset.planid;
         const item = findItem(planId);
         if (item) openModal(item);
       });
     });
 
-    // Tap card to edit too (optional)
-    root.querySelectorAll('.card').forEach(card => {
-      card.addEventListener('click', (e) => {
-        // avoid double trigger when clicking the button
+    // tap row to edit
+    root.querySelectorAll('.session').forEach(row => {
+      row.addEventListener('click', (e) => {
         if (e.target.closest('button')) return;
-        const planId = card.dataset.planid;
+        const planId = row.dataset.planid;
         const item = findItem(planId);
         if (item) openModal(item);
       });
     });
   }
 
-  function rerenderActive() {
-    if (state.currentView === 'rolling') renderRolling();
-    if (state.currentView === 'week') renderWeek();
+  function wireAddTiles(root){
+    root.querySelectorAll('[data-add]').forEach(tile => {
+      tile.addEventListener('click', () => {
+        toast('Add workout (next step)');
+        // v1.1: open "create planned session" modal and write to Plan
+      });
+    });
   }
 
   /** -------------------------
    * Modal
    * ------------------------*/
-  function wireModal() {
+  function wireModal(){
     el('modalCloseBtn').addEventListener('click', closeModal);
     el('modalCancelBtn').addEventListener('click', closeModal);
     el('modalOverlay').addEventListener('click', (e) => {
@@ -312,22 +457,24 @@
       };
 
       el('modalSaveBtn').disabled = true;
-      try {
+      try{
         const log = await callApiUpdateLog(payload);
         patchItemLog(item.PlanID, log);
         toast('Updated');
         closeModal();
-        rerenderActive();
-      } catch (err) {
+        bootstrapWeek();
+        bootstrapStats();
+        renderActive();
+      }catch(err){
         console.error(err);
         toast('Save failed');
-      } finally {
+      }finally{
         el('modalSaveBtn').disabled = false;
       }
     });
   }
 
-  function openModal(item) {
+  function openModal(item){
     state.modal.open = true;
     state.modal.item = item;
 
@@ -345,7 +492,7 @@
     el('modalOverlay').setAttribute('aria-hidden', 'false');
   }
 
-  function closeModal() {
+  function closeModal(){
     state.modal.open = false;
     state.modal.item = null;
     el('modalOverlay').classList.add('hidden');
@@ -355,7 +502,7 @@
   /** -------------------------
    * Data helpers
    * ------------------------*/
-  function groupByDateSlot(items) {
+  function groupByDateSlot(items){
     const out = {};
     (items || []).forEach(it => {
       const d = it.Date;
@@ -365,46 +512,101 @@
       else out[d].AM.push(it);
       out[d].count++;
     });
+    // sort within slots
+    Object.keys(out).forEach(d => {
+      out[d].AM.sort(sortItem);
+      out[d].PM.sort(sortItem);
+    });
     return out;
   }
 
-  function findItem(planId) {
-    const all = [...state.rolling.items, ...state.week.items];
-    return all.find(x => x.PlanID === planId);
+  function sortItem(a,b){
+    return (String(a.Slot||'').localeCompare(String(b.Slot||'')) ||
+            String(a.Sport||'').localeCompare(String(b.Sport||'')) ||
+            String(a.Title||'').localeCompare(String(b.Title||'')));
   }
 
-  function patchItemLog(planId, log) {
+  function findItem(planId){
+    const pool = [...(state.rolling.items||[]), ...(state.week.items||[])];
+    return pool.find(x => x.PlanID === planId);
+  }
+
+  function patchItemLog(planId, log){
     const patch = (arr) => {
       const idx = arr.findIndex(x => x.PlanID === planId);
       if (idx >= 0) arr[idx].Log = log || null;
     };
     patch(state.rolling.items);
-    patch(state.week.items);
+    patch(state.week.items || []);
   }
 
-  function plannedText(it) {
-    const mode = (it.MetricMode || 'BOTH').toUpperCase();
-    const km = Number(it.PlannedKm || 0);
-    const min = Number(it.PlannedMin || 0);
-
-    if (mode === 'KM') return `${fmt1(km)} km planned`;
-    if (mode === 'MIN') return `${fmt0(min)} min planned`;
-    return `${km ? `${fmt1(km)} km` : ''}${(km && min) ? ' • ' : ''}${min ? `${fmt0(min)} min` : ''} planned`.trim();
+  function computeTotalsClient(items){
+    const t = { plannedKm:0, plannedMin:0, doneKm:0, doneMin:0 };
+    (items||[]).forEach(it => {
+      t.plannedKm += num(it.PlannedKm);
+      t.plannedMin += num(it.PlannedMin);
+      const log = it.Log;
+      if (log && (log.Status === 'DONE' || log.Status === 'PARTIAL')){
+        t.doneKm += num(log.ActualKm);
+        t.doneMin += num(log.ActualMin);
+      }
+    });
+    return t;
   }
 
-  function actualText(log) {
-    const ak = Number(log.ActualKm || 0);
-    const am = Number(log.ActualMin || 0);
+  /** -------------------------
+   * Workout colour logic
+   * ------------------------*/
+  function workoutColor(it){
+    const sport = (it.Sport || '').toLowerCase();
+    const title = (it.Title || '').toLowerCase();
+
+    if (sport.includes('swim')) return 'var(--swim)';
+    if (sport.includes('bike') || sport.includes('cycle')) return 'var(--bike)';
+    if (sport.includes('gym')) return 'var(--gym)';
+    if (sport.includes('mob')) return 'var(--mob)';
+
+    // Running type by title keywords
+    if (title.includes('easy')) return 'var(--easy)';
+    if (title.includes('tempo')) return 'var(--tempo)';
+    if (title.includes('interval')) return 'var(--interval)';
+    if (title.includes('hill')) return 'var(--hills)';
+    if (title.includes('long') || title.includes('peak')) return 'var(--long)';
+    if (title.includes('race')) return 'var(--race)';
+
+    return 'rgba(255,255,255,.18)';
+  }
+
+  function plannedText(it){
+    const mode = String(it.MetricMode || 'BOTH').toUpperCase();
+    const km = num(it.PlannedKm);
+    const min = num(it.PlannedMin);
+
+    if (mode === 'KM') return `${fmt1(km)} km`;
+    if (mode === 'MIN') return `${fmt0(min)} min`;
+    const parts = [];
+    if (km) parts.push(`${fmt1(km)} km`);
+    if (min) parts.push(`${fmt0(min)} min`);
+    return parts.join(' • ') || '—';
+  }
+
+  function actualText(log){
+    const ak = num(log.ActualKm);
+    const am = num(log.ActualMin);
     const parts = [];
     if (ak) parts.push(`${fmt1(ak)} km`);
     if (am) parts.push(`${fmt0(am)} min`);
     return `${log.Status}: ${parts.join(' • ') || '—'}`;
   }
 
-  function fmt1(n){ return (Math.round(n*10)/10).toFixed( (Math.abs(n) % 1 === 0) ? 0 : 1 ); }
-  function fmt0(n){ return String(Math.round(Number(n || 0))); }
+  function fmt1(n){
+    const r = Math.round(n*10)/10;
+    return (Math.abs(r)%1===0) ? String(r.toFixed(0)) : String(r.toFixed(1));
+  }
+  function fmt0(n){ return String(Math.round(num(n))); }
+  function num(v){ const n = Number(v); return isNaN(n) ? 0 : n; }
 
-  function esc(s) {
+  function esc(s){
     return String(s || '')
       .replaceAll('&','&amp;')
       .replaceAll('<','&lt;')
@@ -416,21 +618,15 @@
   /** -------------------------
    * Server calls
    * ------------------------*/
-  function callApiSetDone(planId) {
+  function callApiSetDone(planId){
     return new Promise((resolve, reject) => {
-      google.script.run
-        .withSuccessHandler(resolve)
-        .withFailureHandler(reject)
-        .apiSetDone(planId);
+      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).apiSetDone(planId);
     });
   }
 
-  function callApiUpdateLog(payload) {
+  function callApiUpdateLog(payload){
     return new Promise((resolve, reject) => {
-      google.script.run
-        .withSuccessHandler(resolve)
-        .withFailureHandler(reject)
-        .apiUpdateLog(payload);
+      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).apiUpdateLog(payload);
     });
   }
 
