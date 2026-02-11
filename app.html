@@ -1,0 +1,439 @@
+<script>
+  // Server-injected config (from doGet template)
+  const APP_CONFIG = <?= JSON.stringify(appConfig) ?>;
+
+  const state = {
+    settings: null,
+    rolling: { dateFrom: null, dateTo: null, items: [] },
+    week: { weekStart: null, weekEnd: null, items: [], totals: null },
+    currentView: 'rolling',
+    modal: { open: false, item: null }
+  };
+
+  const el = (id) => document.getElementById(id);
+
+  function init() {
+    wireTabs();
+    wireModal();
+    bootstrapRolling();
+  }
+
+  function wireTabs() {
+    document.querySelectorAll('.tab').forEach(btn => {
+      btn.addEventListener('click', () => switchView(btn.dataset.view));
+    });
+  }
+
+  function switchView(view) {
+    state.currentView = view;
+    document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    el('view-rolling').classList.toggle('hidden', view !== 'rolling');
+    el('view-week').classList.toggle('hidden', view !== 'week');
+    el('view-stats').classList.toggle('hidden', view !== 'stats');
+
+    if (view === 'rolling') {
+      renderRolling();
+    } else if (view === 'week') {
+      bootstrapWeek();
+    } else if (view === 'stats') {
+      bootstrapStats();
+    }
+  }
+
+  function setSubtitle(text) {
+    el('subTitle').textContent = text;
+  }
+
+  function toast(msg) {
+    const t = el('toast');
+    t.textContent = msg;
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 1600);
+  }
+
+  /** -------------------------
+   * Bootstrap
+   * ------------------------*/
+  function bootstrapRolling() {
+    setSubtitle('Loading rolling plan…');
+    google.script.run
+      .withSuccessHandler(res => {
+        state.settings = res.settings;
+        state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
+        setSubtitle(`Rolling: ${res.dateFrom} → ${res.dateTo}`);
+        renderRolling();
+      })
+      .withFailureHandler(err => {
+        console.error(err);
+        setSubtitle('Failed to load');
+        toast('Load failed');
+      })
+      .apiBootstrap({});
+  }
+
+  function bootstrapWeek() {
+    setSubtitle('Loading week…');
+    const today = new Date().toISOString().slice(0,10);
+    google.script.run
+      .withSuccessHandler(res => {
+        state.week = { weekStart: res.weekStart, weekEnd: res.weekEnd, items: res.items, totals: res.totals };
+        setSubtitle(`Week: ${res.weekStart} → ${res.weekEnd}`);
+        renderWeek();
+      })
+      .withFailureHandler(err => {
+        console.error(err);
+        toast('Week load failed');
+      })
+      .apiComputeWeek({ anchorDate: today });
+  }
+
+  function bootstrapStats() {
+    setSubtitle('Loading stats…');
+    const today = new Date().toISOString().slice(0,10);
+    const from = new Date();
+    from.setDate(from.getDate() - 30);
+    const dateFrom = from.toISOString().slice(0,10);
+
+    google.script.run
+      .withSuccessHandler(res => {
+        setSubtitle(`Stats: last 30 days`);
+        renderStats(res);
+      })
+      .withFailureHandler(err => {
+        console.error(err);
+        toast('Stats load failed');
+      })
+      .apiComputeStats({ dateFrom, dateTo: today });
+  }
+
+  /** -------------------------
+   * Rendering
+   * ------------------------*/
+  function renderRolling() {
+    const root = el('view-rolling');
+    const grouped = groupByDateSlot(state.rolling.items);
+
+    root.innerHTML = Object.keys(grouped).sort().map(dateISO => {
+      const day = grouped[dateISO];
+      return `
+        <div class="day">
+          <div class="day-header">
+            <div>
+              <div class="day-title">${dateISO}</div>
+              <div class="day-sub">${day.count} session(s)</div>
+            </div>
+          </div>
+
+          ${renderSlot(dateISO, 'AM', day.AM)}
+          ${renderSlot(dateISO, 'PM', day.PM)}
+        </div>
+      `;
+    }).join('') || `<div class="day"><div class="day-title">No sessions found</div></div>`;
+
+    // wire buttons after render
+    wireCards(root);
+  }
+
+  function renderWeek() {
+    const root = el('view-week');
+    const totals = state.week.totals || { plannedKm:0, plannedMin:0, doneKm:0, doneMin:0, bySport:{} };
+
+    const kpis = `
+      <div class="totals">
+        <div class="kpi"><div class="k">Planned km</div><div class="v">${fmt1(totals.plannedKm)}</div></div>
+        <div class="kpi"><div class="k">Done km</div><div class="v">${fmt1(totals.doneKm)}</div></div>
+        <div class="kpi"><div class="k">Planned min</div><div class="v">${fmt0(totals.plannedMin)}</div></div>
+        <div class="kpi"><div class="k">Done min</div><div class="v">${fmt0(totals.doneMin)}</div></div>
+      </div>
+    `;
+
+    const grouped = groupByDateSlot(state.week.items);
+
+    root.innerHTML = `
+      ${kpis}
+      ${Object.keys(grouped).sort().map(dateISO => {
+        const day = grouped[dateISO];
+        return `
+          <div class="day">
+            <div class="day-header">
+              <div>
+                <div class="day-title">${dateISO}</div>
+                <div class="day-sub">${day.count} session(s)</div>
+              </div>
+            </div>
+            ${renderSlot(dateISO, 'AM', day.AM)}
+            ${renderSlot(dateISO, 'PM', day.PM)}
+          </div>
+        `;
+      }).join('')}
+    `;
+
+    wireCards(root);
+  }
+
+  function renderStats(res) {
+    const root = el('view-stats');
+    const s1 = res.streaks?.allPlannedCompleted ?? 0;
+    const s2 = res.streaks?.didSomething ?? 0;
+    const allowance = Number(res.settings?.PartialAllowancePerWeek ?? 1);
+
+    root.innerHTML = `
+      <div class="totals">
+        <div class="kpi">
+          <div class="k">Streak: All planned completed</div>
+          <div class="v">${s1}</div>
+          <div class="day-sub">Allows ${allowance} partial per week</div>
+        </div>
+        <div class="kpi">
+          <div class="k">Streak: Did something</div>
+          <div class="v">${s2}</div>
+          <div class="day-sub">Any done/partial w/ actuals</div>
+        </div>
+      </div>
+
+      <div class="day">
+        <div class="day-title">Next steps</div>
+        <div class="day-sub">We can add sport breakdowns, monthly totals, and a challenge-floor tracker in v1.1</div>
+      </div>
+    `;
+  }
+
+  function renderSlot(dateISO, slot, items) {
+    items = items || [];
+    return `
+      <div class="slot">
+        <div class="slot-title">
+          <div>${slot}</div>
+          <div class="day-sub">${items.length} item(s)</div>
+        </div>
+        ${items.map(it => renderCard(it)).join('') || `<div class="day-sub">No sessions</div>`}
+      </div>
+    `;
+  }
+
+  function renderCard(it) {
+    const log = it.Log;
+    const status = (log && log.Status) ? log.Status : 'PLANNED';
+
+    const dotClass =
+      status === 'DONE' ? 'status-done' :
+      status === 'PARTIAL' ? 'status-partial' :
+      status === 'SKIPPED' ? 'status-skipped' : '';
+
+    const planned = plannedText(it);
+    const actionLabel = (status === 'DONE' || status === 'PARTIAL' || status === 'SKIPPED') ? 'Edit' : 'Done';
+    const actionClass = (actionLabel === 'Done') ? 'primary' : 'ghost';
+
+    return `
+      <div class="card" data-planid="${esc(it.PlanID)}">
+        <div class="pill">
+          <span class="statusDot ${dotClass}"></span>
+          ${esc(it.Sport || 'Other')}
+        </div>
+
+        <div class="meta">
+          <div class="title">${esc(it.Title || '(Untitled)')}</div>
+          <div class="sub">${planned}${it.RPE ? ` • RPE ${esc(String(it.RPE))}` : ''}</div>
+          ${it.Notes ? `<div class="note trunc">${esc(it.Notes)}</div>` : ''}
+          ${log ? `<div class="note">Actual: ${actualText(log)}</div>` : ''}
+        </div>
+
+        <div class="actions">
+          <button class="btn ${actionClass}" data-action="${actionLabel.toLowerCase()}" data-planid="${esc(it.PlanID)}">${actionLabel}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function wireCards(root) {
+    root.querySelectorAll('button[data-action="done"]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const planId = e.currentTarget.dataset.planid;
+        e.currentTarget.disabled = true;
+        try {
+          const log = await callApiSetDone(planId);
+          patchItemLog(planId, log);
+          toast('Marked done');
+          rerenderActive();
+        } catch (err) {
+          console.error(err);
+          toast('Failed');
+        } finally {
+          e.currentTarget.disabled = false;
+        }
+      });
+    });
+
+    root.querySelectorAll('button[data-action="edit"]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const planId = e.currentTarget.dataset.planid;
+        const item = findItem(planId);
+        if (item) openModal(item);
+      });
+    });
+
+    // Tap card to edit too (optional)
+    root.querySelectorAll('.card').forEach(card => {
+      card.addEventListener('click', (e) => {
+        // avoid double trigger when clicking the button
+        if (e.target.closest('button')) return;
+        const planId = card.dataset.planid;
+        const item = findItem(planId);
+        if (item) openModal(item);
+      });
+    });
+  }
+
+  function rerenderActive() {
+    if (state.currentView === 'rolling') renderRolling();
+    if (state.currentView === 'week') renderWeek();
+  }
+
+  /** -------------------------
+   * Modal
+   * ------------------------*/
+  function wireModal() {
+    el('modalCloseBtn').addEventListener('click', closeModal);
+    el('modalCancelBtn').addEventListener('click', closeModal);
+    el('modalOverlay').addEventListener('click', (e) => {
+      if (e.target === el('modalOverlay')) closeModal();
+    });
+
+    el('modalSaveBtn').addEventListener('click', async () => {
+      const item = state.modal.item;
+      if (!item) return;
+
+      const payload = {
+        planId: item.PlanID,
+        status: el('editStatus').value,
+        actualKm: el('editKm').value,
+        actualMin: el('editMin').value,
+        notes: el('editNotes').value
+      };
+
+      el('modalSaveBtn').disabled = true;
+      try {
+        const log = await callApiUpdateLog(payload);
+        patchItemLog(item.PlanID, log);
+        toast('Updated');
+        closeModal();
+        rerenderActive();
+      } catch (err) {
+        console.error(err);
+        toast('Save failed');
+      } finally {
+        el('modalSaveBtn').disabled = false;
+      }
+    });
+  }
+
+  function openModal(item) {
+    state.modal.open = true;
+    state.modal.item = item;
+
+    el('modalTitle').textContent = item.Title || 'Edit session';
+    el('modalMeta').textContent = `${item.Date} • ${item.Slot} • ${item.Sport || 'Other'}`;
+
+    const log = item.Log || null;
+
+    el('editStatus').value = (log?.Status || 'DONE');
+    el('editKm').value = (log?.ActualKm ?? item.PlannedKm ?? '');
+    el('editMin').value = (log?.ActualMin ?? item.PlannedMin ?? '');
+    el('editNotes').value = (log?.LogNotes ?? '');
+
+    el('modalOverlay').classList.remove('hidden');
+    el('modalOverlay').setAttribute('aria-hidden', 'false');
+  }
+
+  function closeModal() {
+    state.modal.open = false;
+    state.modal.item = null;
+    el('modalOverlay').classList.add('hidden');
+    el('modalOverlay').setAttribute('aria-hidden', 'true');
+  }
+
+  /** -------------------------
+   * Data helpers
+   * ------------------------*/
+  function groupByDateSlot(items) {
+    const out = {};
+    (items || []).forEach(it => {
+      const d = it.Date;
+      if (!out[d]) out[d] = { AM: [], PM: [], count: 0 };
+      const slot = (it.Slot || 'AM').toUpperCase();
+      if (slot === 'PM') out[d].PM.push(it);
+      else out[d].AM.push(it);
+      out[d].count++;
+    });
+    return out;
+  }
+
+  function findItem(planId) {
+    const all = [...state.rolling.items, ...state.week.items];
+    return all.find(x => x.PlanID === planId);
+  }
+
+  function patchItemLog(planId, log) {
+    const patch = (arr) => {
+      const idx = arr.findIndex(x => x.PlanID === planId);
+      if (idx >= 0) arr[idx].Log = log || null;
+    };
+    patch(state.rolling.items);
+    patch(state.week.items);
+  }
+
+  function plannedText(it) {
+    const mode = (it.MetricMode || 'BOTH').toUpperCase();
+    const km = Number(it.PlannedKm || 0);
+    const min = Number(it.PlannedMin || 0);
+
+    if (mode === 'KM') return `${fmt1(km)} km planned`;
+    if (mode === 'MIN') return `${fmt0(min)} min planned`;
+    return `${km ? `${fmt1(km)} km` : ''}${(km && min) ? ' • ' : ''}${min ? `${fmt0(min)} min` : ''} planned`.trim();
+  }
+
+  function actualText(log) {
+    const ak = Number(log.ActualKm || 0);
+    const am = Number(log.ActualMin || 0);
+    const parts = [];
+    if (ak) parts.push(`${fmt1(ak)} km`);
+    if (am) parts.push(`${fmt0(am)} min`);
+    return `${log.Status}: ${parts.join(' • ') || '—'}`;
+  }
+
+  function fmt1(n){ return (Math.round(n*10)/10).toFixed( (Math.abs(n) % 1 === 0) ? 0 : 1 ); }
+  function fmt0(n){ return String(Math.round(Number(n || 0))); }
+
+  function esc(s) {
+    return String(s || '')
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'","&#039;");
+  }
+
+  /** -------------------------
+   * Server calls
+   * ------------------------*/
+  function callApiSetDone(planId) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject)
+        .apiSetDone(planId);
+    });
+  }
+
+  function callApiUpdateLog(payload) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject)
+        .apiUpdateLog(payload);
+    });
+  }
+
+  // boot
+  init();
+</script>
