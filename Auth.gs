@@ -117,6 +117,26 @@ function apiLogin(payload) {
   };
 }
 
+
+function apiResetPassword(payload) {
+  payload = payload || {};
+  initTables_();
+  const email = normalizeEmail_(payload.email);
+  const newPassword = String(payload.newPassword || '');
+  if (!email || !newPassword) throw new Error('Email and new password required');
+
+  const sh = getSheet_('Users');
+  const data = sh.getDataRange().getValues();
+  const h = headerMap_(data[0]);
+  for (let r = 1; r < data.length; r++) {
+    if (normalizeEmail_(data[r][h.email]) !== email) continue;
+    sh.getRange(r + 1, h.passwordHash + 1).setValue(hashPassword_(newPassword));
+    sh.getRange(r + 1, h.lastLoginAt + 1).setValue(new Date());
+    return { ok: true };
+  }
+  throw new Error('User not found');
+}
+
 function apiLogout(payload) {
   payload = payload || {};
   const token = String(payload.sessionToken || '');
