@@ -1,133 +1,360 @@
-/********************************
- * Strava webhook endpoint + queue processor
- ********************************/
+<style>
+  :root{
+    --bg:#0b1220;
+    --panel:#111a2c;
+    --card:#16213a;
+    --card2:#0f172a;
+    --text:#e5e7eb;
+    --muted:#93a4b8;
+    --border:#23314f;
+    --shadow: 0 10px 26px rgba(0,0,0,.35);
 
-function doPost(e) {
-  return handleStravaWebhookPost_(e);
-}
+    --easy:#22c55e;
+    --tempo:#f59e0b;
+    --interval:#fb923c;
+    --hills:#10b981;
+    --long:#8b5cf6;
+    --race:#ef4444;
 
-function isStravaWebhookChallenge_(e) {
-  const p = (e && e.parameter) || {};
-  return String(p['hub.mode'] || '') === 'subscribe' || !!p['hub.challenge'];
-}
+    --swim:#06b6d4;
+    --bike:#3b82f6;
+    --gym:#9ca3af;
+    --mob:#14b8a6;
 
-function handleStravaWebhookChallenge_(e) {
-  const p = (e && e.parameter) || {};
-  const verifyToken = String(PropertiesService.getScriptProperties().getProperty('STRAVA_VERIFY_TOKEN') || '');
-  if (String(p['hub.verify_token'] || '') !== verifyToken) {
-    return ContentService.createTextOutput(JSON.stringify({ error: 'invalid verify token' }))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-  return ContentService.createTextOutput(JSON.stringify({ 'hub.challenge': p['hub.challenge'] || '' }))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function handleStravaWebhookPost_(e) {
-  initTables_();
-  const start = Date.now();
-  try {
-    const payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-    enqueueWebhookEvent_(payload);
-  } catch (err) {
-    enqueueWebhookEvent_({ error: String(err) });
-  }
-  const elapsedMs = Date.now() - start;
-  return ContentService.createTextOutput(JSON.stringify({ ok: true, elapsedMs }))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function enqueueWebhookEvent_(evt) {
-  const sh = getSheet_('WebhookQueue');
-  appendRowByHeaders_(sh, WEBHOOK_QUEUE_HEADERS_, {
-    queuedAt: new Date(),
-    subscriptionId: evt.subscription_id || '',
-    objectType: evt.object_type || '',
-    aspectType: evt.aspect_type || '',
-    objectId: evt.object_id || '',
-    ownerId: evt.owner_id || '',
-    eventTime: evt.event_time || '',
-    updatesJson: JSON.stringify(evt.updates || {}),
-    processed: false,
-    processedAt: '',
-    error: ''
-  });
-}
-
-function processWebhookQueue_() {
-  initTables_();
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) return;
-  try {
-    const sh = getSheet_('WebhookQueue');
-    const data = sh.getDataRange().getValues();
-    if (data.length < 2) return;
-    const h = headerMap_(data[0]);
-
-    let handled = 0;
-    for (let r = 1; r < data.length && handled < 20; r++) {
-      const row = data[r];
-      if (isTruthy_(row[h.processed])) continue;
-
-      try {
-        processWebhookEventRow_(row, h);
-        sh.getRange(r + 1, h.processed + 1).setValue(true);
-        sh.getRange(r + 1, h.processedAt + 1).setValue(new Date());
-        sh.getRange(r + 1, h.error + 1).setValue('');
-      } catch (err) {
-        sh.getRange(r + 1, h.error + 1).setValue(String(err));
-        sh.getRange(r + 1, h.processed + 1).setValue(true);
-        sh.getRange(r + 1, h.processedAt + 1).setValue(new Date());
-      }
-      handled++;
-    }
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function processWebhookEventRow_(row, h) {
-  const objectType = String(row[h.objectType] || '');
-  const aspectType = String(row[h.aspectType] || '');
-  const objectId = String(row[h.objectId] || '');
-  const ownerId = String(row[h.ownerId] || '');
-  const updates = JSON.parse(String(row[h.updatesJson] || '{}'));
-
-  const acct = getStravaAccountByAthleteId_(ownerId);
-  if (!acct) throw new Error('No Strava account for ownerId=' + ownerId);
-  const userId = acct.userId;
-
-  if (objectType === 'activity' && (aspectType === 'create' || aspectType === 'update')) {
-    const activity = stravaGetActivity_(userId, objectId);
-    upsertActivityFromStrava_(userId, Number(ownerId || 0), activity, false);
-    upsertLogFromStravaActivity_(userId, activity);
-    return;
+    --primary:#3b82f6;
   }
 
-  if (objectType === 'activity' && aspectType === 'delete') {
-    upsertActivityFromStrava_(userId, Number(ownerId || 0), { id: objectId }, true);
-    upsertLogForDeletedStravaActivity_(userId, objectId);
-    return;
+  *{ box-sizing:border-box; }
+  body{
+    margin:0;
+    font-size:36px;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -20%, rgba(59,130,246,.12), transparent 60%),
+                radial-gradient(1200px 600px at 90% 10%, rgba(139,92,246,.10), transparent 55%),
+                var(--bg);
+    color:var(--text);
   }
 
-  if (objectType === 'athlete' && aspectType === 'update' && String(updates.authorized || '') === 'false') {
-    setStravaConnected_(userId, false);
+  .topbar{
+    position:sticky; top:0; z-index:10;
+    background: rgba(11,18,32,.85);
+    backdrop-filter: blur(10px);
+    border-bottom:1px solid rgba(35,49,79,.7);
+    padding:12px 14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
   }
-}
+  .topbar-left{display:flex; align-items:center; gap:12px;}
+  .avatar{
+    width:38px; height:38px; border-radius:999px;
+    display:grid; place-items:center;
+    background: linear-gradient(135deg, rgba(59,130,246,.35), rgba(139,92,246,.25));
+    border:1px solid rgba(255,255,255,.08);
+    font-weight:900;
+  }
+  .app-title{font-weight:900; letter-spacing:.2px;}
+  .app-sub{font-size:28px; color:var(--muted); margin-top:2px;}
 
-function upsertLogForDeletedStravaActivity_(userId, stravaActivityId) {
-  upsertLog_({
-    PlanID: 'UNPLANNED',
-    Status: 'DELETED',
-    ActualKm: 0,
-    ActualMin: 0,
-    CompletedAt: new Date(),
-    LogNotes: 'Strava activity deleted',
-    UserId: userId,
-    Source: 'strava',
-    StravaActivityId: String(stravaActivityId),
-    SportType: '',
-    ImportedAt: new Date(),
-    PlanMatchConfidence: 0,
-    PlanMatchReason: 'deleted_by_webhook'
-  });
-}
+  .icon-btn{
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    width:42px; height:42px;
+    border-radius:16px;
+    cursor:pointer;
+  }
+
+  .container{
+    max-width:900px;
+    margin:0 auto;
+    padding:14px 14px 90px 14px; /* leave space for bottom nav */
+  }
+
+  .view{ padding-bottom:24px; }
+  .hidden{ display:none; }
+
+  /* Cards */
+  .card{
+    background: linear-gradient(180deg, rgba(22,33,58,.92), rgba(15,23,42,.92));
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:22px;
+    box-shadow: var(--shadow);
+    overflow:hidden;
+  }
+  .card-pad{ padding:14px; }
+
+  .section-title{
+    font-size:32px;
+    color:var(--muted);
+    font-weight:800;
+    margin:6px 2px 10px 2px;
+    text-transform:uppercase;
+    letter-spacing:.08em;
+  }
+
+  /* Today hero */
+  .hero{
+    border-radius:24px;
+    border:1px solid rgba(255,255,255,.08);
+    background: linear-gradient(135deg, rgba(59,130,246,.18), rgba(139,92,246,.12));
+    box-shadow: var(--shadow);
+    padding:16px;
+  }
+  .hero-top{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  }
+  .hero-title{
+    font-size:48px; font-weight:950;
+    letter-spacing:.2px;
+  }
+  .hero-sub{ color:var(--muted); margin-top:4px; font-size:30px; }
+  .hero-kpis{
+    display:flex; flex-wrap:wrap; gap:10px;
+    margin-top:14px;
+  }
+  .kpi{
+    flex: 1 1 140px;
+    background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius:18px;
+    padding:12px;
+  }
+  .kpi .k{ color:var(--muted); font-size:28px; font-weight:800; }
+  .kpi .v{ font-size:48px; font-weight:950; margin-top:3px; }
+
+  /* Progress bar */
+  .bar{
+    width:100%;
+    height:10px;
+    border-radius:999px;
+    background: rgba(255,255,255,.06);
+    overflow:hidden;
+    margin-top:12px;
+  }
+  .bar > div{
+    height:100%;
+    width:0%;
+    border-radius:999px;
+    background: linear-gradient(90deg, rgba(34,197,94,.95), rgba(59,130,246,.9));
+  }
+
+  /* Session rows */
+  .session{
+    display:flex;
+    gap:12px;
+    align-items:flex-start;
+    padding:12px 14px;
+    border-top: 1px solid rgba(255,255,255,.06);
+    cursor:pointer;
+  }
+  .session:first-child{ border-top:none; }
+  .dot{
+    width:14px; height:14px; border-radius:5px;
+    margin-top:3px;
+    background: rgba(255,255,255,.18);
+    flex:0 0 auto;
+  }
+  .session-main{ flex:1; min-width:0; }
+  .session-title{ font-weight:950; line-height:1.1; }
+  .session-sub{ color:var(--muted); font-size:30px; margin-top:4px; }
+  .session-note{ color:var(--muted); font-size:28px; margin-top:6px; opacity:.95; }
+
+  .session-actions{
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    align-items:flex-end;
+    flex:0 0 auto;
+  }
+
+  .btn{
+    border:1px solid rgba(255,255,255,.10);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    padding:10px 12px;
+    border-radius:16px;
+    font-weight:850;
+    cursor:pointer;
+    min-width:92px;
+     font-size:30px;
+  }
+  .btn.primary{
+    background: linear-gradient(135deg, rgba(59,130,246,.95), rgba(37,99,235,.95));
+    border-color: rgba(59,130,246,.55);
+  }
+  .btn.ghost{ background: rgba(255,255,255,.04); }
+  .btn:disabled{ opacity:.6; cursor:not-allowed; }
+
+  /* Week cards */
+  .week-card{
+    margin:12px 0;
+    padding:14px;
+    border-radius:22px;
+    border:1px solid rgba(255,255,255,.08);
+    background: linear-gradient(180deg, rgba(22,33,58,.85), rgba(15,23,42,.85));
+    box-shadow: var(--shadow);
+  }
+  .week-top{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  }
+  .week-title{ font-size:42px; font-weight:950; }
+  .week-meta{ color:var(--muted); font-size:30px; margin-top:4px; }
+  .week-toggle{
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    width:44px; height:44px;
+    border-radius:16px;
+    cursor:pointer;
+  }
+
+  /* Add tiles */
+  .tile-grid{
+    display:grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap:10px;
+  }
+  .tile{
+    border-radius:22px;
+    padding:16px 14px;
+    border:1px solid rgba(255,255,255,.08);
+    color:#fff;
+    font-weight:950;
+    min-height:84px;
+    display:flex;
+    align-items:flex-end;
+    justify-content:flex-start;
+    cursor:pointer;
+    user-select:none;
+    font-size:32px;
+  }
+ .tile small{ display:block; opacity:.85; font-weight:800; margin-bottom:4px; font-size:28px; }
+
+   .tile.run{ background: linear-gradient(135deg, rgba(34,197,94,.95), rgba(22,163,74,.9)); }
+  .tile.swim{ background: linear-gradient(135deg, rgba(6,182,212,.95), rgba(14,116,144,.9)); }
+  .tile.bike{ background: linear-gradient(135deg, rgba(59,130,246,.95), rgba(37,99,235,.9)); }
+  .tile.workout{ background: linear-gradient(135deg, rgba(167,139,250,.95), rgba(124,58,237,.9)); }
+
+  /* Bottom nav */
+  .bottom-nav{
+    position:fixed;
+    left:0; right:0; bottom:0;
+    background: rgba(17,26,44,.92);
+    backdrop-filter: blur(10px);
+    border-top:1px solid rgba(255,255,255,.08);
+    display:flex;
+    justify-content:space-around;
+    padding:10px 6px calc(10px + env(safe-area-inset-bottom)) 6px;
+    z-index:20;
+  }
+  .nav-item{
+    border:none;
+    background:transparent;
+    color:var(--muted);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:4px;
+    padding:8px 10px;
+    border-radius:16px;
+    cursor:pointer;
+    min-width:72px;
+  }
+  .nav-item.active{
+    color:var(--text);
+    background: rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.06);
+  }
+  .nav-ico{ font-size:40px; }
+  .nav-txt{ font-size:28px; font-weight:850; }
+
+  /* Modal */
+  .modal-overlay{
+    position:fixed; inset:0;
+    background:rgba(0,0,0,.55);
+    display:flex;
+    align-items:flex-end;
+    justify-content:center;
+    padding:14px;
+    z-index:50;
+  }
+   .modal-overlay.hidden{ display:none; }
+  .modal{
+    width:min(560px, 100%);
+    background: linear-gradient(180deg, rgba(22,33,58,.98), rgba(15,23,42,.98));
+    border-radius:22px;
+    border:1px solid rgba(255,255,255,.08);
+    box-shadow: var(--shadow);
+    overflow:hidden;
+    color:var(--text);
+  }
+  .modal-header{
+    display:flex; align-items:flex-start; justify-content:space-between;
+    padding:14px 14px 8px 14px;
+    border-bottom:1px solid rgba(255,255,255,.08);
+  }
+  .modal-title{ font-weight:950; }
+   .modal-meta{ font-size:28px; color:var(--muted); margin-top:2px; }
+  .modal-body{ padding:12px 14px; }
+  .modal-footer{
+    display:flex; gap:10px;
+    padding:12px 14px 14px 14px;
+    border-top:1px solid rgba(255,255,255,.08);
+    justify-content:flex-end;
+  }
+  .field{ display:flex; flex-direction:column; gap:6px; margin:10px 0; }
+  .field span{ font-size:28px; color:var(--muted); font-weight:900; }
+  .row{ display:flex; gap:12px; }
+  .row .field{ flex:1; }
+
+  input, select, textarea{
+    width:100%;
+    padding:10px 12px;
+    border-radius:16px;
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.03);
+    color:var(--text);
+    font:inherit;
+    outline:none;
+  }
+  input:focus, select:focus, textarea:focus{
+    border-color: rgba(59,130,246,.55);
+    box-shadow: 0 0 0 4px rgba(59,130,246,.12);
+  }
+
+.preview-table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:26px;
+  }
+  .preview-table th, .preview-table td{
+    border:1px solid rgba(255,255,255,.08);
+    padding:6px 8px;
+    text-align:left;
+    vertical-align:top;
+  }
+  .preview-table th{ background: rgba(255,255,255,.06); }
+  .chip-warn{ color:#f59e0b; font-weight:800; }
+  .chip-err{ color:#ef4444; font-weight:800; }
+
+  /* Toast */
+  .toast{
+    position:fixed;
+    left:50%;
+    bottom:90px;
+    transform:translateX(-50%);
+    background: rgba(0,0,0,.75);
+    color:#fff;
+    padding:10px 14px;
+    border-radius:16px;
+    font-weight:900;
+    box-shadow: var(--shadow);
+    z-index:60;
+  }
+
+  @media (max-width: 420px){
+    .tile-grid{ grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
