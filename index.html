@@ -15,7 +15,10 @@
         </div>
       </div>
 
-      <div class="topbar-right" style="display:flex; gap:8px; align-items:center;">
+      <div class="topbar-right" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+        <div id="stravaStatusBadge" class="strava-status hidden"></div>
+        <button class="btn ghost" id="resumeBackfillBtn" style="min-width:auto; padding:8px 10px;" title="Resume historical sync">Resume Backfill</button>
+        <button class="btn ghost" id="restartBackfillBtn" style="min-width:auto; padding:8px 10px;" title="Restart historical sync cursor">Restart Backfill</button>
         <button class="btn ghost" id="connectStravaBtn" style="min-width:auto; padding:8px 10px;">Connect Strava</button>
         <button class="icon-btn" id="refreshBtn" aria-label="Refresh">⟳</button>
       </div>
