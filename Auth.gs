@@ -4,7 +4,7 @@
 
 const USER_HEADERS_ = ['userId', 'email', 'displayName', 'passwordHash', 'role', 'createdAt', 'lastLoginAt', 'isActive'];
 const SESSION_HEADERS_ = ['sessionToken', 'userId', 'expiresAt', 'createdAt', 'lastSeenAt'];
-const STRAVA_ACCOUNT_HEADERS_ = ['userId', 'stravaAthleteId', 'accessToken', 'refreshToken', 'expiresAt', 'scope', 'connected', 'lastSyncAfter', 'createdAt', 'updatedAt', 'backfillPage', 'backfillDone'];
+const STRAVA_ACCOUNT_HEADERS_ = ['userId', 'stravaAthleteId', 'accessToken', 'refreshToken', 'expiresAt', 'scope', 'connected', 'lastSyncAfter', 'createdAt', 'updatedAt', 'backfillMode', 'backfillPage', 'backfillBeforeEpoch', 'backfillDone', 'backfillLastRunAt'];
 const ACTIVITY_HEADERS_ = ['stravaActivityId', 'userId', 'athleteId', 'startDate', 'type', 'name', 'distanceM', 'movingTimeS', 'elapsedTimeS', 'totalElevationGainM', 'averageHeartrate', 'maxHeartrate', 'averageSpeed', 'summaryPolyline', 'rawJson', 'deleted', 'updatedAt'];
 const WEBHOOK_QUEUE_HEADERS_ = ['queuedAt', 'subscriptionId', 'objectType', 'aspectType', 'objectId', 'ownerId', 'eventTime', 'updatesJson', 'processed', 'processedAt', 'error'];
 const LOG_HEADERS_ = ['PlanID', 'Status', 'ActualKm', 'ActualMin', 'CompletedAt', 'LogNotes', 'UserId', 'Source', 'StravaActivityId', 'SportType', 'ImportedAt', 'PlanMatchConfidence', 'PlanMatchReason'];
