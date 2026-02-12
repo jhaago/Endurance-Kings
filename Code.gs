@@ -147,6 +147,26 @@ function apiListPlan(args) {
   return { items };
 }
 
+
+function apiListActivities(args) {
+  args = args || {};
+  const auth = requireSessionFromArgs_(args);
+  const limit = Math.max(1, Math.min(500, Number(args.limit || 200)));
+  const sh = getSheet_('Activities');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return { items: [] };
+  const h = headerMap_(data[0]);
+
+  const items = data.slice(1)
+    .filter(r => String(r[h.userId] || '') === String(auth.user.userId))
+    .filter(r => String(r[h.deleted] || '').toLowerCase() !== 'true')
+    .map(r => rowToObj_(h, r))
+    .sort((a, b) => String(b.startDate || '').localeCompare(String(a.startDate || '')))
+    .slice(0, limit);
+
+  return { items };
+}
+
 function apiComputeStats(args) {
   args = args || {};
   const settings = getSettings_();
@@ -156,6 +176,7 @@ function apiComputeStats(args) {
 
   const dateFrom = String(args.dateFrom || addDaysIso_(isoToday_(tz), -30));
   const dateTo = String(args.dateTo || isoToday_(tz));
+const granularity = String(args.granularity || 'week').toLowerCase() === 'month' ? 'month' : 'week';
 
   const planRows = readPlanBetween_(dateFrom, dateTo, tz);
   ensurePlanIds_(planRows);
@@ -231,10 +252,13 @@ function apiComputeStats(args) {
     if (p.Date >= monthStart) monthDoneKm += km;
   });
 
+const distanceTrend = computeDistanceTrend_(items, weekStartsOn, tz, granularity);
+
   return {
     settings,
     dateFrom,
     dateTo,
+    granularity,
     streaks: {
       allPlannedCompleted: streakAllPlanned,
       didSomething: streakDidSomething
@@ -242,8 +266,24 @@ function apiComputeStats(args) {
     kmSummary: {
       monthDoneKm,
       yearDoneKm
-    }
+      },
+    distanceTrend
   };
+}
+
+function computeDistanceTrend_(items, weekStartsOn, tz, granularity) {
+  const buckets = {};
+  (items || []).forEach(it => {
+    const log = it.Log;
+    if (!log || !['DONE', 'PARTIAL'].includes(log.Status)) return;
+    const km = coerceNumber_(log.ActualKm);
+    if (!km) return;
+    const key = granularity === 'month'
+      ? String(it.Date || '').slice(0, 7)
+      : weekRange_(it.Date, weekStartsOn, tz).weekStart;
+    buckets[key] = (buckets[key] || 0) + km;
+  });
+  return Object.keys(buckets).sort().map(k => ({ label: k, km: buckets[k] }));
 }
 
 /** -------------------------
