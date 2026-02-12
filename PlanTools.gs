@@ -1,390 +1,360 @@
-/********************************
- * Plan import + generator
- ********************************/
+<style>
+  :root{
+    --bg:#0b1220;
+    --panel:#111a2c;
+    --card:#16213a;
+    --card2:#0f172a;
+    --text:#e5e7eb;
+    --muted:#93a4b8;
+    --border:#23314f;
+    --shadow: 0 10px 26px rgba(0,0,0,.35);
 
-const PLAN_ALLOWED_SPORTS_ = ['RUN', 'CYCLE', 'BIKE', 'SWIM', 'GYM', 'WALK', 'HIKE', 'ROW', 'WORKOUT', 'OTHER'];
-const PLAN_CANON_HEADERS_ = ['PlanID', 'PlanName', 'Date', 'SportType', 'WorkoutType', 'PlannedKm', 'PlannedMin', 'Notes', 'Week', 'DayName', 'RPE', 'UserId', 'ExternalRowId'];
-const PLAN_LEGACY_HEADERS_ = ['Slot', 'Sport', 'Title', 'MetricMode'];
+    --easy:#22c55e;
+    --tempo:#f59e0b;
+    --interval:#fb923c;
+    --hills:#10b981;
+    --long:#8b5cf6;
+    --race:#ef4444;
 
-function ensurePlanHeaders_() {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName('Plan');
-  const allHeaders = ['PlanID', ...PLAN_CANON_HEADERS_.filter(h => h !== 'PlanID'), ...PLAN_LEGACY_HEADERS_];
-  if (!sh) {
-    sh = ss.insertSheet('Plan');
-    sh.getRange(1, 1, 1, allHeaders.length).setValues([allHeaders]);
-    return sh;
-  }
-  if (sh.getLastRow() < 1) {
-    sh.getRange(1, 1, 1, allHeaders.length).setValues([allHeaders]);
-    return sh;
-  }
-  const row = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(v => String(v || '').trim());
-  allHeaders.forEach(h => {
-    if (!row.includes(h)) {
-      sh.getRange(1, sh.getLastColumn() + 1).setValue(h);
-      row.push(h);
-    }
-  });
-  return sh;
-}
+    --swim:#06b6d4;
+    --bike:#3b82f6;
+    --gym:#9ca3af;
+    --mob:#14b8a6;
 
-function planImportPreview(payload) {
-  payload = payload || {};
-  const auth = requireSessionFromArgs_(payload);
-  ensurePlanHeaders_();
-
-  const headers = (payload.headers || []).map(h => String(h || '').trim());
-  const rows = payload.rows || [];
-  const mapping = inferPlanHeaderMap_(headers);
-
-  const normalizedRows = [];
-  const issues = [];
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i] || [];
-    const rowObj = normalizeImportedPlanRow_(mapping, headers, r, i + 2, auth.user.userId);
-    normalizedRows.push(rowObj.row);
-    issues.push({ rowNumber: i + 2, warnings: rowObj.warnings, errors: rowObj.errors });
+    --primary:#3b82f6;
   }
 
-  return {
-    mappedHeaders: mapping,
-    normalizedRows,
-    issues,
-    sample: normalizedRows.slice(0, 20),
-    criticalErrorCount: issues.reduce((a, it) => a + it.errors.length, 0)
-  };
-}
-
-function planImportCommit(payload) {
-  payload = payload || {};
-  const auth = requireSessionFromArgs_(payload);
-  const preview = planImportPreview(payload);
-  if (preview.criticalErrorCount > 0) {
-    throw new Error('Import blocked: fix critical row errors first.');
+  *{ box-sizing:border-box; }
+  body{
+    margin:0;
+    font-size:36px;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -20%, rgba(59,130,246,.12), transparent 60%),
+                radial-gradient(1200px 600px at 90% 10%, rgba(139,92,246,.10), transparent 55%),
+                var(--bg);
+    color:var(--text);
   }
 
-  const sh = ensurePlanHeaders_();
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(10000);
-  try {
-    const data = sh.getDataRange().getValues();
-    const headers = headerMap_(data[0]);
-    const existing = indexExistingPlanRows_(data, headers);
-
-    let inserted = 0;
-    let updated = 0;
-
-    preview.normalizedRows.forEach(row => {
-      const key = planRowKey_(row);
-      const existingRow = findExistingPlanRow_(existing, row, key);
-      const rowValues = buildPlanSheetRow_(headers, row);
-      if (existingRow) {
-        sh.getRange(existingRow, 1, 1, data[0].length).setValues([rowValues]);
-        updated++;
-      } else {
-        sh.appendRow(rowValues);
-        inserted++;
-      }
-    });
-
-    return { inserted, updated, total: preview.normalizedRows.length, issues: preview.issues.slice(0, 40) };
-  } finally {
-    lock.releaseLock();
+  .topbar{
+    position:sticky; top:0; z-index:10;
+    background: rgba(11,18,32,.85);
+    backdrop-filter: blur(10px);
+    border-bottom:1px solid rgba(35,49,79,.7);
+    padding:12px 14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
   }
-}
+  .topbar-left{display:flex; align-items:center; gap:12px;}
+  .avatar{
+    width:38px; height:38px; border-radius:999px;
+    display:grid; place-items:center;
+    background: linear-gradient(135deg, rgba(59,130,246,.35), rgba(139,92,246,.25));
+    border:1px solid rgba(255,255,255,.08);
+    font-weight:900;
+  }
+  .app-title{font-weight:900; letter-spacing:.2px;}
+  .app-sub{font-size:28px; color:var(--muted); margin-top:2px;}
 
-function planGenerateCommit(params) {
-  params = params || {};
-  const auth = requireSessionFromArgs_(params);
-  const settings = getSettings_();
-  const tz = settings.Timezone || Session.getScriptTimeZone();
-  const planName = String(params.planName || 'Generated Plan').trim();
-  const targetDistanceKm = Number(params.targetDistanceKm || 10);
-  const planLengthWeeks = Math.max(4, Number(params.planLengthWeeks || 12));
-  const trainingDays = Math.min(7, Math.max(2, Number(params.trainingDaysPerWeek || 4)));
-  const longRunDay = String(params.longRunDay || 'SUN').toUpperCase();
-  const includeIntervals = params.includeIntervals == null ? trainingDays >= 4 : !!params.includeIntervals;
-  const includeTempo = params.includeTempo == null ? trainingDays >= 3 : !!params.includeTempo;
-  const startDateISO = String(params.startDate || nextWeekdayIso_(1)); // Monday default
-
-  const planId = 'PLAN-' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMddHHmmss');
-  const start = new Date(startDateISO + 'T00:00:00');
-  const dayNames = ['SUN','MON','TUE','WED','THU','FRI','SAT'];
-
-  const taperWeeks = targetDistanceKm >= 21 ? 2 : 1;
-  const baseWeeklyKm = Math.max(12, targetDistanceKm * 1.2);
-  let currentWeeklyKm = baseWeeklyKm;
-
-  const rows = [];
-  for (let w = 1; w <= planLengthWeeks; w++) {
-    const isDeload = (w % 4 === 0) && (w !== planLengthWeeks);
-    const isTaper = w > (planLengthWeeks - taperWeeks);
-
-    if (w === 1) currentWeeklyKm = baseWeeklyKm;
-    else if (isDeload) currentWeeklyKm = Math.max(10, currentWeeklyKm * 0.75);
-    else if (isTaper) currentWeeklyKm = currentWeeklyKm * 0.8;
-    else currentWeeklyKm = currentWeeklyKm * 1.07;
-
-    const longRunKm = Math.min(targetDistanceKm * 0.85, Math.max(targetDistanceKm * 0.35, currentWeeklyKm * 0.35));
-
-    const weekDates = [];
-    for (let d = 0; d < 7; d++) {
-      const dt = new Date(start);
-      dt.setDate(start.getDate() + ((w - 1) * 7) + d);
-      weekDates.push(dt);
-    }
-
-    const longIdx = dayNames.indexOf(longRunDay);
-    const trainingIdxs = pickTrainingDayIndexes_(trainingDays, longIdx);
-
-    let qualityAdded = 0;
-    trainingIdxs.forEach((idx, pos) => {
-      const dt = weekDates[idx];
-      const dayName = dayNames[dt.getDay()];
-      let workoutType = 'Easy';
-      let km = currentWeeklyKm / trainingDays;
-      let notes = '';
-
-      if (idx === longIdx) {
-        workoutType = 'Long Run';
-        km = longRunKm;
-        notes = 'Steady effort, conversational pace.';
-      } else if (trainingDays <= 3) {
-        if (includeTempo && qualityAdded < 1 && pos === 0) {
-          workoutType = 'Tempo';
-          km = currentWeeklyKm * 0.28;
-          qualityAdded++;
-          notes = 'Controlled threshold effort.';
-        }
-      } else {
-        if (includeIntervals && qualityAdded < 1 && pos === 1) {
-          workoutType = 'Intervals';
-          km = currentWeeklyKm * 0.22;
-          qualityAdded++;
-          notes = 'Quality reps; full warmup/cooldown.';
-        } else if (includeTempo && qualityAdded < 2 && pos === 0) {
-          workoutType = 'Tempo';
-          km = currentWeeklyKm * 0.24;
-          qualityAdded++;
-          notes = 'Sustained moderate-hard effort.';
-        }
-      }
-
-      if (trainingDays >= 6 && workoutType === 'Easy') {
-        notes = 'Recovery-focused easy run.';
-      }
-
-      rows.push(enrichPlanRow_({
-        PlanID: planId,
-        PlanName: planName,
-        Date: Utilities.formatDate(dt, tz, 'yyyy-MM-dd'),
-        DayName: dayName,
-        SportType: 'Run',
-        WorkoutType: workoutType,
-        PlannedKm: Math.round(Math.max(2, km) * 10) / 10,
-        PlannedMin: '',
-        Notes: notes,
-        Week: w,
-        RPE: workoutType === 'Long Run' ? 4 : (workoutType === 'Easy' ? 3 : 6),
-        UserId: auth.user.userId,
-        ExternalRowId: planId + '-' + w + '-' + dayName
-      }));
-    });
+  .icon-btn{
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    width:42px; height:42px;
+    border-radius:16px;
+    cursor:pointer;
   }
 
-  const sh = ensurePlanHeaders_();
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(10000);
-  try {
-    const data = sh.getDataRange().getValues();
-    const headers = headerMap_(data[0]);
-    const existing = indexExistingPlanRows_(data, headers);
-
-    let inserted = 0;
-    let updated = 0;
-    rows.forEach(row => {
-      const key = planRowKey_(row);
-      const existingRow = findExistingPlanRow_(existing, row, key);
-      const rowValues = buildPlanSheetRow_(headers, row);
-      if (existingRow) {
-        sh.getRange(existingRow, 1, 1, data[0].length).setValues([rowValues]);
-        updated++;
-      } else {
-        sh.appendRow(rowValues);
-        inserted++;
-      }
-    });
-    return { planId, inserted, updated, total: rows.length };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function inferPlanHeaderMap_(headers) {
-  const synonymMap = {
-    PlanID: ['planid', 'plan_id'],
-    PlanName: ['planname', 'plan_name', 'plan'],
-    Date: ['date', 'day', 'session_date'],
-    SportType: ['sport', 'type', 'discipline'],
-    WorkoutType: ['workout', 'session', 'category', 'intensity'],
-    PlannedKm: ['km', 'distance', 'distance_km', 'planned_km'],
-    PlannedMin: ['min', 'mins', 'minutes', 'duration', 'duration_min'],
-    Notes: ['notes', 'description', 'details'],
-    Week: ['week'],
-    DayName: ['dayname', 'day_name'],
-    RPE: ['rpe'],
-    UserId: ['userid', 'user_id', 'user'],
-    ExternalRowId: ['externalrowid', 'external_row_id', 'externalid', 'source_row_id']
-  };
-
-  const normalizedHeaders = headers.map(h => String(h || '').trim().toLowerCase());
-  const out = {};
-  Object.keys(synonymMap).forEach(canon => {
-    const candidates = [canon.toLowerCase()].concat(synonymMap[canon]);
-    const idx = normalizedHeaders.findIndex(h => candidates.includes(h));
-    if (idx >= 0) out[canon] = headers[idx];
-  });
-  return out;
-}
-
-function normalizeImportedPlanRow_(mapping, headers, rowArr, rowNumber, defaultUserId) {
-  const src = {};
-  headers.forEach((h, i) => src[h] = rowArr[i]);
-  const warnings = [];
-  const errors = [];
-
-  const rawDate = getMappedValue_(src, mapping, 'Date');
-  const dateIso = toIsoDate_(rawDate, Session.getScriptTimeZone());
-  if (!dateIso) errors.push('Invalid date');
-
-  const sport = String(getMappedValue_(src, mapping, 'SportType') || 'Run').trim();
-  if (!PLAN_ALLOWED_SPORTS_.includes(sport.toUpperCase())) warnings.push('Unknown sport type: ' + sport);
-
-  const plannedKm = numOrBlank_(getMappedValue_(src, mapping, 'PlannedKm'));
-  const plannedMin = numOrBlank_(getMappedValue_(src, mapping, 'PlannedMin'));
-  const notes = String(getMappedValue_(src, mapping, 'Notes') || '').trim();
-  if (plannedKm === '' && plannedMin === '' && notes.length < 5) warnings.push('Neither PlannedKm nor PlannedMin present');
-
-  let planId = String(getMappedValue_(src, mapping, 'PlanID') || '').trim();
-  if (!planId) {
-    planId = 'PLAN-' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMddHHmmss') + '-' + rowNumber;
-    warnings.push('Auto-generated PlanID');
+  .container{
+    max-width:900px;
+    margin:0 auto;
+    padding:14px 14px 90px 14px; /* leave space for bottom nav */
   }
 
-  const row = enrichPlanRow_({
-    PlanID: planId,
-    PlanName: String(getMappedValue_(src, mapping, 'PlanName') || 'Imported Plan').trim(),
-    Date: dateIso,
-    SportType: sport || 'Run',
-    WorkoutType: String(getMappedValue_(src, mapping, 'WorkoutType') || 'Easy').trim(),
-    PlannedKm: plannedKm,
-    PlannedMin: plannedMin,
-    Notes: notes,
-    Week: getMappedValue_(src, mapping, 'Week') || '',
-    DayName: String(getMappedValue_(src, mapping, 'DayName') || '').trim(),
-    RPE: numOrBlank_(getMappedValue_(src, mapping, 'RPE')),
-    UserId: String(getMappedValue_(src, mapping, 'UserId') || defaultUserId || '').trim(),
-    ExternalRowId: String(getMappedValue_(src, mapping, 'ExternalRowId') || '').trim()
-  });
+  .view{ padding-bottom:24px; }
+  .hidden{ display:none; }
 
-  return { row, warnings, errors };
-}
-
-function enrichPlanRow_(row) {
-  const metricMode = row.PlannedKm !== '' && row.PlannedMin !== '' ? 'BOTH' : (row.PlannedKm !== '' ? 'KM' : 'MIN');
-  const dayName = row.DayName || dayNameFromIso_(row.Date);
-  return {
-    PlanID: row.PlanID || '',
-    PlanName: row.PlanName || '',
-    Date: row.Date || '',
-    SportType: row.SportType || 'Run',
-    WorkoutType: row.WorkoutType || 'Easy',
-    PlannedKm: row.PlannedKm === '' ? '' : Number(row.PlannedKm),
-    PlannedMin: row.PlannedMin === '' ? '' : Number(row.PlannedMin),
-    Notes: row.Notes || '',
-    Week: row.Week || '',
-    DayName: dayName,
-    RPE: row.RPE === '' ? '' : Number(row.RPE),
-    UserId: row.UserId || '',
-    ExternalRowId: row.ExternalRowId || '',
-    Slot: 'AM',
-    Sport: row.SportType || 'Run',
-    Title: row.WorkoutType || 'Session',
-    MetricMode: metricMode
-  };
-}
-
-function indexExistingPlanRows_(data, headers) {
-  const byExternalRowId = {};
-  const byComposite = {};
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    const ext = headers.ExternalRowId != null ? String(row[headers.ExternalRowId] || '').trim() : '';
-    const planId = String(row[headers.PlanID] || '').trim();
-    const dateIso = toIsoDate_(row[headers.Date], Session.getScriptTimeZone());
-    const wt = headers.WorkoutType != null
-      ? String(row[headers.WorkoutType] || '').trim()
-      : String(row[headers.Title] || '').trim();
-
-    if (ext) byExternalRowId[ext] = r + 1;
-    if (planId && dateIso && wt) byComposite[(planId + '|' + dateIso + '|' + wt).toLowerCase()] = r + 1;
+  /* Cards */
+  .card{
+    background: linear-gradient(180deg, rgba(22,33,58,.92), rgba(15,23,42,.92));
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:22px;
+    box-shadow: var(--shadow);
+    overflow:hidden;
   }
-  return { byExternalRowId, byComposite };
-}
+  .card-pad{ padding:14px; }
 
-function findExistingPlanRow_(existing, row, compositeKey) {
-  if (row.ExternalRowId && existing.byExternalRowId[row.ExternalRowId]) return existing.byExternalRowId[row.ExternalRowId];
-  if (compositeKey && existing.byComposite[compositeKey]) return existing.byComposite[compositeKey];
-  return null;
-}
-
-function planRowKey_(row) {
-  return (String(row.PlanID || '') + '|' + String(row.Date || '') + '|' + String(row.WorkoutType || '')).toLowerCase();
-}
-
-function buildPlanSheetRow_(headers, rowObj) {
-  const out = new Array(Object.keys(headers).length).fill('');
-  Object.keys(headers).forEach(k => {
-    out[headers[k]] = rowObj[k] == null ? '' : rowObj[k];
-  });
-  return out;
-}
-
-function getMappedValue_(src, mapping, canonical) {
-  const mappedHeader = mapping[canonical];
-  if (!mappedHeader) return '';
-  return src[mappedHeader];
-}
-
-function numOrBlank_(v) {
-  if (v === '' || v == null) return '';
-  const n = Number(v);
-  return isNaN(n) ? '' : n;
-}
-
-function dayNameFromIso_(iso) {
-  if (!iso) return '';
-  const d = new Date(iso + 'T00:00:00');
-  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
-}
-
-function nextWeekdayIso_(targetDow) {
-  const now = new Date();
-  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  let diff = (targetDow - d.getDay() + 7) % 7;
-  if (diff === 0) diff = 7;
-  d.setDate(d.getDate() + diff);
-  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-}
-
-function pickTrainingDayIndexes_(daysPerWeek, longDayIdx) {
-  const preferred = [1, 2, 3, 4, 5, 6, 0]; // Mon..Sun
-  const out = [longDayIdx];
-  for (let i = 0; i < preferred.length && out.length < daysPerWeek; i++) {
-    const idx = preferred[i];
-    if (out.includes(idx)) continue;
-    out.push(idx);
+  .section-title{
+    font-size:32px;
+    color:var(--muted);
+    font-weight:800;
+    margin:6px 2px 10px 2px;
+    text-transform:uppercase;
+    letter-spacing:.08em;
   }
-  return out.sort((a, b) => a - b);
-}
+
+  /* Today hero */
+  .hero{
+    border-radius:24px;
+    border:1px solid rgba(255,255,255,.08);
+    background: linear-gradient(135deg, rgba(59,130,246,.18), rgba(139,92,246,.12));
+    box-shadow: var(--shadow);
+    padding:16px;
+  }
+  .hero-top{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  }
+  .hero-title{
+    font-size:48px; font-weight:950;
+    letter-spacing:.2px;
+  }
+  .hero-sub{ color:var(--muted); margin-top:4px; font-size:30px; }
+  .hero-kpis{
+    display:flex; flex-wrap:wrap; gap:10px;
+    margin-top:14px;
+  }
+  .kpi{
+    flex: 1 1 140px;
+    background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius:18px;
+    padding:12px;
+  }
+  .kpi .k{ color:var(--muted); font-size:28px; font-weight:800; }
+  .kpi .v{ font-size:48px; font-weight:950; margin-top:3px; }
+
+  /* Progress bar */
+  .bar{
+    width:100%;
+    height:10px;
+    border-radius:999px;
+    background: rgba(255,255,255,.06);
+    overflow:hidden;
+    margin-top:12px;
+  }
+  .bar > div{
+    height:100%;
+    width:0%;
+    border-radius:999px;
+    background: linear-gradient(90deg, rgba(34,197,94,.95), rgba(59,130,246,.9));
+  }
+
+  /* Session rows */
+  .session{
+    display:flex;
+    gap:12px;
+    align-items:flex-start;
+    padding:12px 14px;
+    border-top: 1px solid rgba(255,255,255,.06);
+    cursor:pointer;
+  }
+  .session:first-child{ border-top:none; }
+  .dot{
+    width:14px; height:14px; border-radius:5px;
+    margin-top:3px;
+    background: rgba(255,255,255,.18);
+    flex:0 0 auto;
+  }
+  .session-main{ flex:1; min-width:0; }
+  .session-title{ font-weight:950; line-height:1.1; }
+  .session-sub{ color:var(--muted); font-size:30px; margin-top:4px; }
+  .session-note{ color:var(--muted); font-size:28px; margin-top:6px; opacity:.95; }
+
+  .session-actions{
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    align-items:flex-end;
+    flex:0 0 auto;
+  }
+
+  .btn{
+    border:1px solid rgba(255,255,255,.10);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    padding:10px 12px;
+    border-radius:16px;
+    font-weight:850;
+    cursor:pointer;
+    min-width:92px;
+     font-size:30px;
+  }
+  .btn.primary{
+    background: linear-gradient(135deg, rgba(59,130,246,.95), rgba(37,99,235,.95));
+    border-color: rgba(59,130,246,.55);
+  }
+  .btn.ghost{ background: rgba(255,255,255,.04); }
+  .btn:disabled{ opacity:.6; cursor:not-allowed; }
+
+  /* Week cards */
+  .week-card{
+    margin:12px 0;
+    padding:14px;
+    border-radius:22px;
+    border:1px solid rgba(255,255,255,.08);
+    background: linear-gradient(180deg, rgba(22,33,58,.85), rgba(15,23,42,.85));
+    box-shadow: var(--shadow);
+  }
+  .week-top{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  }
+  .week-title{ font-size:42px; font-weight:950; }
+  .week-meta{ color:var(--muted); font-size:30px; margin-top:4px; }
+  .week-toggle{
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.04);
+    color:var(--text);
+    width:44px; height:44px;
+    border-radius:16px;
+    cursor:pointer;
+  }
+
+  /* Add tiles */
+  .tile-grid{
+    display:grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap:10px;
+  }
+  .tile{
+    border-radius:22px;
+    padding:16px 14px;
+    border:1px solid rgba(255,255,255,.08);
+    color:#fff;
+    font-weight:950;
+    min-height:84px;
+    display:flex;
+    align-items:flex-end;
+    justify-content:flex-start;
+    cursor:pointer;
+    user-select:none;
+    font-size:32px;
+  }
+ .tile small{ display:block; opacity:.85; font-weight:800; margin-bottom:4px; font-size:28px; }
+
+   .tile.run{ background: linear-gradient(135deg, rgba(34,197,94,.95), rgba(22,163,74,.9)); }
+  .tile.swim{ background: linear-gradient(135deg, rgba(6,182,212,.95), rgba(14,116,144,.9)); }
+  .tile.bike{ background: linear-gradient(135deg, rgba(59,130,246,.95), rgba(37,99,235,.9)); }
+  .tile.workout{ background: linear-gradient(135deg, rgba(167,139,250,.95), rgba(124,58,237,.9)); }
+
+  /* Bottom nav */
+  .bottom-nav{
+    position:fixed;
+    left:0; right:0; bottom:0;
+    background: rgba(17,26,44,.92);
+    backdrop-filter: blur(10px);
+    border-top:1px solid rgba(255,255,255,.08);
+    display:flex;
+    justify-content:space-around;
+    padding:10px 6px calc(10px + env(safe-area-inset-bottom)) 6px;
+    z-index:20;
+  }
+  .nav-item{
+    border:none;
+    background:transparent;
+    color:var(--muted);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:4px;
+    padding:8px 10px;
+    border-radius:16px;
+    cursor:pointer;
+    min-width:72px;
+  }
+  .nav-item.active{
+    color:var(--text);
+    background: rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.06);
+  }
+  .nav-ico{ font-size:40px; }
+  .nav-txt{ font-size:28px; font-weight:850; }
+
+  /* Modal */
+  .modal-overlay{
+    position:fixed; inset:0;
+    background:rgba(0,0,0,.55);
+    display:flex;
+    align-items:flex-end;
+    justify-content:center;
+    padding:14px;
+    z-index:50;
+  }
+   .modal-overlay.hidden{ display:none; }
+  .modal{
+    width:min(560px, 100%);
+    background: linear-gradient(180deg, rgba(22,33,58,.98), rgba(15,23,42,.98));
+    border-radius:22px;
+    border:1px solid rgba(255,255,255,.08);
+    box-shadow: var(--shadow);
+    overflow:hidden;
+    color:var(--text);
+  }
+  .modal-header{
+    display:flex; align-items:flex-start; justify-content:space-between;
+    padding:14px 14px 8px 14px;
+    border-bottom:1px solid rgba(255,255,255,.08);
+  }
+  .modal-title{ font-weight:950; }
+   .modal-meta{ font-size:28px; color:var(--muted); margin-top:2px; }
+  .modal-body{ padding:12px 14px; }
+  .modal-footer{
+    display:flex; gap:10px;
+    padding:12px 14px 14px 14px;
+    border-top:1px solid rgba(255,255,255,.08);
+    justify-content:flex-end;
+  }
+  .field{ display:flex; flex-direction:column; gap:6px; margin:10px 0; }
+  .field span{ font-size:28px; color:var(--muted); font-weight:900; }
+  .row{ display:flex; gap:12px; }
+  .row .field{ flex:1; }
+
+  input, select, textarea{
+    width:100%;
+    padding:10px 12px;
+    border-radius:16px;
+    border:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.03);
+    color:var(--text);
+    font:inherit;
+    outline:none;
+  }
+  input:focus, select:focus, textarea:focus{
+    border-color: rgba(59,130,246,.55);
+    box-shadow: 0 0 0 4px rgba(59,130,246,.12);
+  }
+
+.preview-table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:26px;
+  }
+  .preview-table th, .preview-table td{
+    border:1px solid rgba(255,255,255,.08);
+    padding:6px 8px;
+    text-align:left;
+    vertical-align:top;
+  }
+  .preview-table th{ background: rgba(255,255,255,.06); }
+  .chip-warn{ color:#f59e0b; font-weight:800; }
+  .chip-err{ color:#ef4444; font-weight:800; }
+
+  /* Toast */
+  .toast{
+    position:fixed;
+    left:50%;
+    bottom:90px;
+    transform:translateX(-50%);
+    background: rgba(0,0,0,.75);
+    color:#fff;
+    padding:10px 14px;
+    border-radius:16px;
+    font-weight:900;
+    box-shadow: var(--shadow);
+    z-index:60;
+  }
+
+  @media (max-width: 420px){
+    .tile-grid{ grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
