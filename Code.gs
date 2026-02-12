@@ -6,12 +6,19 @@
  *  - Settings (A:B): RollingDays, WeekStartsOn, Timezone, PartialAllowancePerWeek
  *******************************/
 
-function doGet() {
+function doGet(e) {
+  e = e || { parameter: {} };
+  if (isStravaWebhookChallenge_(e)) {
+    return handleStravaWebhookChallenge_(e);
+  }
+  if (isStravaOAuthCallback_(e)) {
+    return handleStravaOAuthCallback_(e);
+  }
+
   const tpl = HtmlService.createTemplateFromFile('index');
   tpl.appConfig = getSettings_();
   return tpl.evaluate()
     .setTitle('Training Planner')
-    // If you want embedded in a container, set XFrameOptionsMode. For normal web app, you can omit.
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
@@ -24,6 +31,7 @@ function include(filename) {
  * ------------------------*/
 function apiBootstrap(args) {
   args = args || {};
+  const auth = requireSessionFromArgs_(args);
   const settings = getSettings_();
   const tz = settings.Timezone || Session.getScriptTimeZone();
 
@@ -33,29 +41,27 @@ function apiBootstrap(args) {
   const dateTo = args.dateTo || addDaysIso_(dateFrom, rollingDays);
 
   const planRows = readPlanBetween_(dateFrom, dateTo, tz);
-  ensurePlanIds_(planRows); // assigns missing IDs and persists them
+  ensurePlanIds_(planRows);
 
   const planIds = planRows.map(r => r.PlanID).filter(Boolean);
-  const logMap = readLogsByPlanId_(planIds);
+const logMap = readLogsByPlanId_(planIds, auth.user.userId);
 
-  // Merge plan + log to “items”
-  const items = planRows.map(p => {
-    const log = logMap[p.PlanID] || null;
-    return {
-      ...p,
-      Log: log
-    };
-  });
+  const items = planRows.map(p => ({ ...p, Log: logMap[p.PlanID] || null }));
 
   return {
     settings,
     dateFrom,
     dateTo,
-    items
+   items,
+    user: publicUser_(auth.user),
+    strava: getStravaConnectionStatus_(auth.user.userId)
   };
 }
 
-function apiSetDone(planId) {
+function apiSetDone(args) {
+  args = args || {};
+  const auth = requireSessionFromArgs_(args);
+  const planId = String(args.planId || '').trim();
   if (!planId) throw new Error('planId required');
   const plan = readPlanById_(planId);
   if (!plan) throw new Error('PlanID not found: ' + planId);
@@ -67,20 +73,23 @@ function apiSetDone(planId) {
     ActualKm: coerceNumber_(plan.PlannedKm),
     ActualMin: coerceNumber_(plan.PlannedMin),
     CompletedAt: now,
-    LogNotes: ''
+    LogNotes: '',
+    UserId: auth.user.userId,
+    Source: 'manual'
   };
 
   upsertLog_(update);
-  return readLogsByPlanId_([planId])[planId];
+  return readLogsByPlanId_([planId], auth.user.userId)[planId];
 }
 
 function apiUpdateLog(payload) {
   payload = payload || {};
+  const auth = requireSessionFromArgs_(payload);
   const planId = String(payload.planId || '').trim();
   if (!planId) throw new Error('planId required');
 
   const status = String(payload.status || 'DONE').toUpperCase();
-  if (!['DONE', 'PARTIAL', 'SKIPPED'].includes(status)) {
+  if (!['DONE', 'PARTIAL', 'SKIPPED', 'DELETED'].includes(status)) {
     throw new Error('Invalid status: ' + status);
   }
 
@@ -90,11 +99,13 @@ function apiUpdateLog(payload) {
     ActualKm: coerceNumber_(payload.actualKm),
     ActualMin: coerceNumber_(payload.actualMin),
     CompletedAt: new Date(),
-    LogNotes: String(payload.notes || '')
+    LogNotes: String(payload.notes || ''),
+    UserId: auth.user.userId,
+    Source: 'manual'
   };
 
   upsertLog_(update);
-  return readLogsByPlanId_([planId])[planId];
+  return readLogsByPlanId_([planId], auth.user.userId)[planId];
 }
 
 function apiComputeWeek(args) {
@@ -110,7 +121,8 @@ function apiComputeWeek(args) {
   ensurePlanIds_(planRows);
 
   const planIds = planRows.map(r => r.PlanID).filter(Boolean);
-  const logMap = readLogsByPlanId_(planIds);
+  const auth = requireSessionFromArgs_(args);
+  const logMap = readLogsByPlanId_(planIds, auth.user.userId);
 
   const items = planRows.map(p => ({ ...p, Log: logMap[p.PlanID] || null }));
   const totals = computeTotals_(items);
@@ -131,7 +143,8 @@ function apiComputeStats(args) {
   const planRows = readPlanBetween_(dateFrom, dateTo, tz);
   ensurePlanIds_(planRows);
   const planIds = planRows.map(r => r.PlanID).filter(Boolean);
-  const logMap = readLogsByPlanId_(planIds);
+  const auth = requireSessionFromArgs_(args);
+  const logMap = readLogsByPlanId_(planIds, auth.user.userId);
 
   const items = planRows.map(p => ({ ...p, Log: logMap[p.PlanID] || null }));
   const daily = groupByDate_(items);
@@ -188,7 +201,7 @@ function apiComputeStats(args) {
   const kmRows = readPlanBetween_(yearStart, dateTo, tz);
   ensurePlanIds_(kmRows);
   const kmPlanIds = kmRows.map(r => r.PlanID).filter(Boolean);
-  const kmLogMap = readLogsByPlanId_(kmPlanIds);
+  const kmLogMap = readLogsByPlanId_(kmPlanIds, auth.user.userId);
 
   let yearDoneKm = 0;
   let monthDoneKm = 0;
@@ -248,8 +261,7 @@ function getSettings_() {
 
 function readPlanBetween_(dateFromISO, dateToISO, tz) {
   const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName('Plan');
-  if (!sh) throw new Error('Missing sheet tab: Plan');
+  const sh = ensurePlanHeaders_();
 
   const data = sh.getDataRange().getValues();
   if (data.length < 2) return [];
@@ -266,18 +278,31 @@ function readPlanBetween_(dateFromISO, dateToISO, tz) {
     if (dateISO < dateFromISO) continue;
     if (dateISO > dateToISO) continue;
 
+  const sport = headers.Sport != null ? String(row[headers.Sport] || '').trim() : String(row[headers.SportType] || '').trim();
+    const title = headers.Title != null ? String(row[headers.Title] || '').trim() : String(row[headers.WorkoutType] || '').trim();
+    const metricModeRaw = headers.MetricMode != null ? String(row[headers.MetricMode] || '').trim().toUpperCase() : '';
+    const plannedKm = coerceNumber_(row[headers.PlannedKm]);
+    const plannedMin = coerceNumber_(row[headers.PlannedMin]);
+    const metricMode = metricModeRaw || ((plannedKm && plannedMin) ? 'BOTH' : (plannedKm ? 'KM' : 'MIN'));
+
     out.push({
       _row: r + 1,
       PlanID: String(row[headers.PlanID] || '').trim(),
       Date: dateISO,
-      Slot: String(row[headers.Slot] || '').trim().toUpperCase(), // AM/PM
-      Sport: String(row[headers.Sport] || '').trim(),
-      Title: String(row[headers.Title] || '').trim(),
-      MetricMode: String(row[headers.MetricMode] || 'BOTH').trim().toUpperCase(),
-      PlannedKm: coerceNumber_(row[headers.PlannedKm]),
-      PlannedMin: coerceNumber_(row[headers.PlannedMin]),
-      RPE: coerceNumber_(row[headers.RPE]),
-      Notes: String(row[headers.Notes] || '')
+     Slot: (headers.Slot != null ? String(row[headers.Slot] || '').trim().toUpperCase() : 'AM') || 'AM',
+      Sport: sport,
+      Title: title,
+      MetricMode: metricMode,
+      PlannedKm: plannedKm,
+      PlannedMin: plannedMin,
+      RPE: headers.RPE != null ? coerceNumber_(row[headers.RPE]) : 0,
+      Notes: String((headers.Notes != null ? row[headers.Notes] : '') || ''),
+      PlanName: headers.PlanName != null ? String(row[headers.PlanName] || '') : '',
+      WorkoutType: headers.WorkoutType != null ? String(row[headers.WorkoutType] || '') : title,
+      SportType: headers.SportType != null ? String(row[headers.SportType] || '') : sport,
+      DayName: headers.DayName != null ? String(row[headers.DayName] || '') : '',
+      Week: headers.Week != null ? row[headers.Week] : '',
+      UserId: headers.UserId != null ? String(row[headers.UserId] || '') : ''
     });
   }
   // sort by date then slot then sport
@@ -287,8 +312,7 @@ function readPlanBetween_(dateFromISO, dateToISO, tz) {
 
 function readPlanById_(planId) {
   const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName('Plan');
-  if (!sh) throw new Error('Missing sheet tab: Plan');
+   const sh = ensurePlanHeaders_();
 
   const data = sh.getDataRange().getValues();
   if (data.length < 2) return null;
@@ -300,18 +324,27 @@ function readPlanById_(planId) {
     if (id === planId) {
       const settings = getSettings_();
       const tz = settings.Timezone || Session.getScriptTimeZone();
+      const sport = headers.Sport != null ? String(row[headers.Sport] || '').trim() : String(row[headers.SportType] || '').trim();
+      const title = headers.Title != null ? String(row[headers.Title] || '').trim() : String(row[headers.WorkoutType] || '').trim();
+      const plannedKm = coerceNumber_(row[headers.PlannedKm]);
+      const plannedMin = coerceNumber_(row[headers.PlannedMin]);
+      const metricModeRaw = headers.MetricMode != null ? String(row[headers.MetricMode] || 'BOTH').trim().toUpperCase() : '';
+      const metricMode = metricModeRaw || ((plannedKm && plannedMin) ? 'BOTH' : (plannedKm ? 'KM' : 'MIN'));
       return {
         _row: r + 1,
         PlanID: id,
         Date: toIsoDate_(row[headers.Date], tz),
-        Slot: String(row[headers.Slot] || '').trim().toUpperCase(),
-        Sport: String(row[headers.Sport] || '').trim(),
-        Title: String(row[headers.Title] || '').trim(),
-        MetricMode: String(row[headers.MetricMode] || 'BOTH').trim().toUpperCase(),
-        PlannedKm: coerceNumber_(row[headers.PlannedKm]),
-        PlannedMin: coerceNumber_(row[headers.PlannedMin]),
-        RPE: coerceNumber_(row[headers.RPE]),
-        Notes: String(row[headers.Notes] || '')
+        Slot: (headers.Slot != null ? String(row[headers.Slot] || '').trim().toUpperCase() : 'AM') || 'AM',
+        Sport: sport,
+        Title: title,
+        MetricMode: metricMode,
+        PlannedKm: plannedKm,
+        PlannedMin: plannedMin,
+        RPE: headers.RPE != null ? coerceNumber_(row[headers.RPE]) : 0,
+        Notes: String((headers.Notes != null ? row[headers.Notes] : '') || ''),
+        PlanName: headers.PlanName != null ? String(row[headers.PlanName] || '') : '',
+        WorkoutType: headers.WorkoutType != null ? String(row[headers.WorkoutType] || '') : title,
+        SportType: headers.SportType != null ? String(row[headers.SportType] || '') : sport
       };
     }
   }
@@ -324,7 +357,7 @@ function ensurePlanIds_(planRows) {
   if (!missing.length) return;
 
   const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName('Plan');
+   const sh = ensurePlanHeaders_();
   const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
   const headers = headerMap_(header);
 
@@ -339,7 +372,7 @@ function ensurePlanIds_(planRows) {
   updates.forEach(u => sh.getRange(u.row, u.col).setValue(u.value));
 }
 
-function readLogsByPlanId_(planIds) {
+function readLogsByPlanId_(planIds, userId) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName('Log');
   if (!sh) return {};
@@ -356,6 +389,10 @@ function readLogsByPlanId_(planIds) {
     const row = data[r];
     const id = String(row[headers.PlanID] || '').trim();
     if (!id || !idSet[id]) continue;
+    if (userId && headers.UserId != null) {
+      const rowUser = String(row[headers.UserId] || '').trim();
+      if (rowUser && rowUser !== userId) continue;
+    }
 
     out[id] = {
       _row: r + 1,
@@ -364,13 +401,16 @@ function readLogsByPlanId_(planIds) {
       ActualKm: coerceNumber_(row[headers.ActualKm]),
       ActualMin: coerceNumber_(row[headers.ActualMin]),
       CompletedAt: row[headers.CompletedAt] ? new Date(row[headers.CompletedAt]) : null,
-      LogNotes: String(row[headers.LogNotes] || '')
+      LogNotes: String(row[headers.LogNotes] || ''),
+      UserId: headers.UserId != null ? String(row[headers.UserId] || '') : '',
+      Source: headers.Source != null ? String(row[headers.Source] || '') : ''
     };
   }
   return out;
 }
 
 function upsertLog_(logObj) {
+  initTables_();
   const lock = LockService.getDocumentLock();
   lock.waitLock(5000);
   try {
@@ -378,28 +418,27 @@ function upsertLog_(logObj) {
     let sh = ss.getSheetByName('Log');
     if (!sh) {
       sh = ss.insertSheet('Log');
-      sh.appendRow(['PlanID', 'Status', 'ActualKm', 'ActualMin', 'CompletedAt', 'LogNotes']);
+      sh.appendRow(LOG_HEADERS_);
     }
 
     const data = sh.getDataRange().getValues();
     const headers = headerMap_(data[0]);
 
-    // Find existing row
+    const stravaId = String(logObj.StravaActivityId || '').trim();
+    // Find existing row by StravaActivityId (for imports) or PlanID+UserId
     let foundRow = null;
     for (let r = 1; r < data.length; r++) {
-      const id = String(data[r][headers.PlanID] || '').trim();
-      if (id === logObj.PlanID) { foundRow = r + 1; break; }
+      const row = data[r];
+      const rowStravaId = headers.StravaActivityId != null ? String(row[headers.StravaActivityId] || '').trim() : '';
+      const id = String(row[headers.PlanID] || '').trim();
+      const rowUser = headers.UserId != null ? String(row[headers.UserId] || '').trim() : '';
+      if (stravaId && rowStravaId && rowStravaId === stravaId) { foundRow = r + 1; break; }
+      if (id === String(logObj.PlanID || '').trim() && (!logObj.UserId || !rowUser || rowUser === logObj.UserId)) { foundRow = r + 1; break; }
     }
 
     if (!foundRow) {
-      sh.appendRow([
-        logObj.PlanID,
-        logObj.Status,
-        logObj.ActualKm,
-        logObj.ActualMin,
-        logObj.CompletedAt,
-        logObj.LogNotes
-      ]);
+       const rowValues = LOG_HEADERS_.map(h => valueForLogHeader_(h, logObj));
+      sh.appendRow(rowValues);
       return;
     }
 
@@ -409,7 +448,14 @@ function upsertLog_(logObj) {
     sh.getRange(foundRow, headers.ActualMin + 1).setValue(logObj.ActualMin);
     sh.getRange(foundRow, headers.CompletedAt + 1).setValue(logObj.CompletedAt);
     sh.getRange(foundRow, headers.LogNotes + 1).setValue(logObj.LogNotes);
-
+writeIfHeader_(sh, foundRow, headers, 'UserId', logObj.UserId || '');
+    writeIfHeader_(sh, foundRow, headers, 'Source', logObj.Source || 'manual');
+    writeIfHeader_(sh, foundRow, headers, 'StravaActivityId', logObj.StravaActivityId || '');
+    writeIfHeader_(sh, foundRow, headers, 'SportType', logObj.SportType || '');
+    writeIfHeader_(sh, foundRow, headers, 'ImportedAt', logObj.ImportedAt || '');
+    writeIfHeader_(sh, foundRow, headers, 'PlanMatchConfidence', logObj.PlanMatchConfidence || '');
+    writeIfHeader_(sh, foundRow, headers, 'PlanMatchReason', logObj.PlanMatchReason || '');
+    
   } finally {
     lock.releaseLock();
   }
