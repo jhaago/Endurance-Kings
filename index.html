@@ -41,19 +41,19 @@
     <!-- Bottom Nav -->
     <nav class="bottom-nav" role="navigation" aria-label="Bottom navigation">
       <button class="nav-item active" data-view="today">
-        <div class="nav-ico">☀</div>
+         <div class="nav-ico">📅</div>
          <div class="nav-txt">Week</div>
       </button>
       <button class="nav-item" data-view="plan">
-        <div class="nav-ico">📅</div>
+        <div class="nav-ico">☰</div>
         <div class="nav-txt">Plan</div>
       </button>
       <button class="nav-item" data-view="activities">
-        <div class="nav-ico">📈</div>
+        <div class="nav-ico">🏃</div>
         <div class="nav-txt">Activities</div>
       </button>
       <button class="nav-item" data-view="stats">
-        <div class="nav-ico">🏅</div>
+        <div class="nav-ico">📊</div>
         <div class="nav-txt">Stats</div>
       </button>
     </nav>
@@ -119,6 +119,12 @@
           <label class="field"><span id="authNameLabel" class="hidden">Display name</span><input id="authDisplayName" class="hidden" type="text" /></label>
           <label class="field"><span>Password</span><input id="authPassword" type="password" autocomplete="current-password" /></label>
           <button class="btn primary" id="authSubmitBtn" style="width:100%;">Login</button>
+          <button class="btn ghost" id="authResetToggleBtn" style="width:100%; margin-top:8px;">Reset password</button>
+          <div id="authResetPanel" class="hidden" style="margin-top:8px; border-top:1px solid rgba(255,255,255,.08); padding-top:8px;">
+            <label class="field"><span>Email</span><input id="authResetEmail" type="email" autocomplete="email" /></label>
+            <label class="field"><span>New password</span><input id="authResetPassword" type="password" autocomplete="new-password" /></label>
+            <button class="btn primary" id="authResetSubmitBtn" style="width:100%;">Save new password</button>
+          </div>
         </div>
       </div>
     </div>
