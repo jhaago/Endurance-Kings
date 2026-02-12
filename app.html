@@ -6,7 +6,9 @@
     stats: null,
        weekAnchorDate: null,
     currentView: 'today',
-    modal: { open: false, item: null }
+    modal: { open: false, item: null },
+    auth: { sessionToken: localStorage.getItem('sessionToken') || null, user: null, needsSetup: false, strava: null },
+    planImport: { headers: [], rows: [], preview: null }
   };
 
   const el = (id) => document.getElementById(id);
@@ -15,11 +17,29 @@
     wireBottomNav();
     wireModal();
     wireTopbar();
-    bootstrapAll();
+    wireAuth();
+    wirePlanTools();
+    checkAuthAndStart();
   }
 
   function wireTopbar(){
     el('refreshBtn').addEventListener('click', () => bootstrapAll(true));
+  el('connectStravaBtn').addEventListener('click', async () => {
+      try {
+        if (state.auth.strava?.connected) {
+          await apiCall('apiDisconnectStrava', {});
+          state.auth.strava = { connected:false };
+          updateStravaButton();
+          toast('Strava disconnected');
+          return;
+        }
+        const res = await apiCall('apiGetStravaConnectUrl', {});
+        if (res?.url) window.open(res.url, '_blank');
+      } catch(err){
+        console.error(err);
+        toast('Unable to start Strava connect');
+      }
+    });
   }
 
   function wireBottomNav(){
@@ -54,7 +74,206 @@
     setTimeout(() => t.classList.add('hidden'), 1600);
   }
 
-  /** -------------------------
+   
+  async function checkAuthAndStart(){
+    try {
+      const res = await callRaw('apiGetAuthState', { sessionToken: state.auth.sessionToken });
+      state.auth.needsSetup = !!res.needsSetup;
+      if (!res.authenticated) {
+        showAuthOverlay(res.needsSetup);
+        return;
+      }
+      state.auth.user = res.user;
+      state.auth.strava = res.strava || { connected:false };
+      el('appTitle').textContent = `Training Planner${res.user?.displayName ? ' • ' + res.user.displayName : ''}`;
+      updateStravaButton();
+      hideAuthOverlay();
+      bootstrapAll();
+    } catch (err) {
+      console.error(err);
+      showAuthOverlay(false);
+    }
+  }
+
+  function wireAuth(){
+    el('authSubmitBtn').addEventListener('click', async () => {
+      const payload = {
+        email: el('authEmail').value,
+        password: el('authPassword').value,
+        displayName: el('authDisplayName').value
+      };
+      try {
+        const res = state.auth.needsSetup
+          ? await callRaw('apiCreateAdmin', payload)
+          : await callRaw('apiLogin', payload);
+        state.auth.sessionToken = res.sessionToken;
+        localStorage.setItem('sessionToken', state.auth.sessionToken);
+        hideAuthOverlay();
+        await checkAuthAndStart();
+      } catch (err) {
+        toast('Login failed');
+      }
+    });
+  }
+
+  function showAuthOverlay(needsSetup){
+    state.auth.needsSetup = !!needsSetup;
+    el('authTitle').textContent = needsSetup ? 'Create Admin' : 'Login';
+    el('authMeta').textContent = needsSetup ? 'First run setup' : 'Sign in to continue';
+    el('authNameLabel').classList.toggle('hidden', !needsSetup);
+    el('authDisplayName').classList.toggle('hidden', !needsSetup);
+    el('authOverlay').classList.remove('hidden');
+  }
+
+  function hideAuthOverlay(){ el('authOverlay').classList.add('hidden'); }
+
+  function updateStravaButton(){
+    const b = el('connectStravaBtn');
+    const connected = !!state.auth.strava?.connected;
+    b.textContent = connected ? 'Disconnect Strava' : 'Connect Strava';
+  }
+
+
+  function wirePlanTools(){
+    el('planImportCloseBtn').addEventListener('click', closePlanImportModal);
+    el('planGenerateCloseBtn').addEventListener('click', closePlanGenerateModal);
+    el('planImportOverlay').addEventListener('click', (e) => { if (e.target === el('planImportOverlay')) closePlanImportModal(); });
+    el('planGenerateOverlay').addEventListener('click', (e) => { if (e.target === el('planGenerateOverlay')) closePlanGenerateModal(); });
+
+    el('planImportPreviewBtn').addEventListener('click', async () => {
+      try {
+        const file = el('planImportFile').files?.[0];
+        if (!file) { toast('Pick a CSV file first'); return; }
+        const text = await file.text();
+        const parsed = parseCsvText(text);
+        state.planImport.headers = parsed.headers;
+        state.planImport.rows = parsed.rows;
+
+        const preview = await apiCall('planImportPreview', {
+          headers: parsed.headers,
+          rows: parsed.rows
+        });
+        state.planImport.preview = preview;
+        renderPlanImportPreview(preview);
+        el('planImportCommitBtn').disabled = !!preview.criticalErrorCount;
+      } catch (err) {
+        console.error(err);
+        toast('Preview failed');
+      }
+    });
+
+    el('planImportCommitBtn').addEventListener('click', async () => {
+      try {
+        if (!state.planImport.preview) { toast('Run preview first'); return; }
+        const res = await apiCall('planImportCommit', {
+          headers: state.planImport.headers,
+          rows: state.planImport.rows
+        });
+        toast(`Imported ${res.total} rows (${res.inserted} new, ${res.updated} updated)`);
+        closePlanImportModal();
+        bootstrapAll(true);
+      } catch (err) {
+        console.error(err);
+        toast('Import failed');
+      }
+    });
+
+    el('planGenerateCommitBtn').addEventListener('click', async () => {
+      try {
+        const payload = {
+          planName: el('genPlanName').value,
+          targetDistanceKm: Number(el('genTargetKm').value || 10),
+          planLengthWeeks: Number(el('genLengthWeeks').value || 12),
+          trainingDaysPerWeek: Number(el('genDaysPerWeek').value || 4),
+          longRunDay: el('genLongRunDay').value,
+          startDate: el('genStartDate').value || '',
+          includeIntervals: !!el('genIncludeIntervals').checked,
+          includeTempo: !!el('genIncludeTempo').checked
+        };
+        const res = await apiCall('planGenerateCommit', payload);
+        el('planGenerateSummary').textContent = `Generated ${res.total} rows (${res.inserted} new, ${res.updated} updated), PlanID ${res.planId}`;
+        toast('Plan generated');
+        bootstrapAll(true);
+      } catch (err) {
+        console.error(err);
+        toast('Generate failed');
+      }
+    });
+  }
+
+  function openPlanImportModal(){
+    el('planImportOverlay').classList.remove('hidden');
+    el('planImportSummary').textContent = 'Upload CSV and click Preview.';
+    el('planImportPreviewWrap').innerHTML = '';
+    el('planImportCommitBtn').disabled = true;
+  }
+  function closePlanImportModal(){ el('planImportOverlay').classList.add('hidden'); }
+  function openPlanGenerateModal(){
+    el('planGenerateOverlay').classList.remove('hidden');
+    el('planGenerateSummary').textContent = '';
+  }
+  function closePlanGenerateModal(){ el('planGenerateOverlay').classList.add('hidden'); }
+
+  function renderPlanImportPreview(preview){
+    const warnCount = (preview.issues || []).reduce((a,it)=>a+(it.warnings||[]).length,0);
+    const errCount = Number(preview.criticalErrorCount || 0);
+    el('planImportSummary').innerHTML = `Rows: ${(preview.normalizedRows||[]).length} • <span class="chip-warn">Warnings: ${warnCount}</span> • <span class="chip-err">Errors: ${errCount}</span>`;
+
+    const sample = preview.sample || [];
+    if (!sample.length) {
+      el('planImportPreviewWrap').innerHTML = '<div class="hero-sub">No rows parsed.</div>';
+      return;
+    }
+
+    const cols = ['PlanID','PlanName','Date','SportType','WorkoutType','PlannedKm','PlannedMin','Notes'];
+    const table = `
+      <table class="preview-table">
+        <thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+        <tbody>
+          ${sample.map(r => `<tr>${cols.map(c => `<td>${esc(r[c] ?? '')}</td>`).join('')}</tr>`).join('')}
+        </tbody>
+      </table>`;
+
+    const issueTop = (preview.issues || []).filter(it => (it.warnings?.length || it.errors?.length)).slice(0, 8)
+      .map(it => `<div class="hero-sub">Row ${it.rowNumber}: ${(it.errors||[]).join('; ')} ${(it.warnings||[]).join('; ')}</div>`).join('');
+
+    el('planImportPreviewWrap').innerHTML = table + (issueTop ? `<div style="margin-top:8px;">${issueTop}</div>` : '');
+  }
+
+  function parseCsvText(text){
+    const rows = [];
+    let cur = '';
+    let row = [];
+    let inQ = false;
+    for (let i=0;i<text.length;i++) {
+      const ch = text[i];
+      const nxt = text[i+1];
+      if (ch === '"') {
+        if (inQ && nxt === '"') { cur += '"'; i++; }
+        else inQ = !inQ;
+      } else if (ch === ',' && !inQ) {
+        row.push(cur.trim());
+        cur = '';
+      } else if ((ch === '\n' || ch === '\r') && !inQ) {
+        if (ch === '\r' && nxt === '\n') i++;
+        row.push(cur.trim());
+        if (row.some(v => v !== '')) rows.push(row);
+        row = [];
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.length || row.length) {
+      row.push(cur.trim());
+      if (row.some(v => v !== '')) rows.push(row);
+    }
+    const headers = rows.length ? rows[0] : [];
+    return { headers, rows: rows.slice(1) };
+  }
+
+
+/** -------------------------
    * Bootstrap
    * ------------------------*/
   async function bootstrapAll(force){
@@ -79,7 +298,7 @@
         setSubtitle('Load failed');
         toast('Load failed');
       })
-      .apiBootstrap({});
+      .apiBootstrap(withSession({}));
   }
 
   function bootstrapWeek(anchorDate){
@@ -91,7 +310,7 @@
         if (state.currentView === 'plan' || state.currentView === 'today') renderActive();
       })
       .withFailureHandler(err => console.error(err))
-      .apiComputeWeek({ anchorDate: anchor });
+      .apiComputeWeek(withSession({ anchorDate: anchor }));
   }
 
   function changeWeek(offset){
@@ -113,7 +332,7 @@
         if (state.currentView === 'stats' || state.currentView === 'today') renderActive();
       })
       .withFailureHandler(err => console.error(err))
-      .apiComputeStats({ dateFrom, dateTo: today });
+       .apiComputeStats(withSession({ dateFrom, dateTo: today }));
   }
 
   /** -------------------------
@@ -170,14 +389,12 @@
       <div class="section-title">Up next</div>
       ${renderSessionCardBlock(nextItems, false, true)}
 
-      <div class="section-title">Add run</div>
+       <div class="section-title">Add activity</div>
       <div class="tile-grid">
-        <div class="tile easy" data-add="easy"><small>Run</small>Easy</div>
-        <div class="tile tempo" data-add="tempo"><small>Run</small>Tempo</div>
-        <div class="tile intervals" data-add="intervals"><small>Run</small>Intervals</div>
-        <div class="tile hills" data-add="hills"><small>Run</small>Hills</div>
-        <div class="tile long" data-add="long"><small>Run</small>Long</div>
-        <div class="tile race" data-add="race"><small>Run</small>Race</div>
+        <div class="tile run" data-add="run"><small>Add</small>Run</div>
+        <div class="tile swim" data-add="swim"><small>Add</small>Swim</div>
+        <div class="tile bike" data-add="bike"><small>Add</small>Bike</div>
+        <div class="tile workout" data-add="workout"><small>Add</small>Workout</div>
       </div>
 
       <div class="section-title">Streaks</div>
@@ -240,6 +457,8 @@
             <div class="bar"><div style="width:${pct}%"></div></div>
           </div>
              <div style="display:flex; gap:8px; align-items:center;">
+              <button class="btn ghost" data-action="open-import" style="min-width:auto;">Add Plan</button>
+            <button class="btn primary" data-action="open-generate" style="min-width:auto;">Create Plan</button>
             <button class="week-toggle" data-action="prev-week" aria-label="Previous week">‹</button>
             <button class="week-toggle" data-action="next-week" aria-label="Next week">›</button>
           </div>
@@ -263,6 +482,8 @@
     wireSessions(root);
     root.querySelector('[data-action="prev-week"]')?.addEventListener('click', () => changeWeek(-1));
     root.querySelector('[data-action="next-week"]')?.addEventListener('click', () => changeWeek(1));
+   root.querySelector('[data-action="open-import"]')?.addEventListener('click', openPlanImportModal);
+    root.querySelector('[data-action="open-generate"]')?.addEventListener('click', openPlanGenerateModal);
   }
 
   function renderSlotList(dateISO, slot, items){
@@ -400,7 +621,7 @@
         const planId = e.currentTarget.dataset.planid;
         e.currentTarget.disabled = true;
         try{
-          const log = await callApiSetDone(planId);
+          const log = await callApiSetDone({ planId });
           patchItemLog(planId, log);
           toast('Marked done');
           bootstrapWeek();   // refresh totals
@@ -439,7 +660,8 @@
   function wireAddTiles(root){
     root.querySelectorAll('[data-add]').forEach(tile => {
       tile.addEventListener('click', () => {
-        toast('Add workout (next step)');
+        const activity = tile.dataset.add;
+        toast(`Add ${activity} activity (next step)`);
         // v1.1: open "create planned session" modal and write to Plan
       });
     });
@@ -648,16 +870,36 @@ function formatDateWithDay(dateISO){
   /** -------------------------
    * Server calls
    * ------------------------*/
-  function callApiSetDone(planId){
+ function withSession(payload){
+    return { ...(payload || {}), sessionToken: state.auth.sessionToken };
+  }
+
+  function callRaw(method, payload){
     return new Promise((resolve, reject) => {
-      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).apiSetDone(planId);
+   google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[method](payload || {});
     });
   }
 
+  async function apiCall(method, payload){
+    try {
+      return await callRaw(method, withSession(payload));
+    } catch (err) {
+      const msg = String(err && err.message || err || '');
+      if (msg.includes('Session expired') || msg.includes('Authentication required')) {
+        localStorage.removeItem('sessionToken');
+        state.auth.sessionToken = null;
+        showAuthOverlay(false);
+      }
+      throw err;
+    }
+  }
+
+  function callApiSetDone(payload){
+    return apiCall('apiSetDone', payload);
+  }
+
   function callApiUpdateLog(payload){
-    return new Promise((resolve, reject) => {
-      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).apiUpdateLog(payload);
-    });
+     return apiCall('apiUpdateLog', payload);
   }
 
   // boot
