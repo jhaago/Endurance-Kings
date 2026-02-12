@@ -15,7 +15,8 @@
         </div>
       </div>
 
-      <div class="topbar-right">
+      <div class="topbar-right" style="display:flex; gap:8px; align-items:center;">
+        <button class="btn ghost" id="connectStravaBtn" style="min-width:auto; padding:8px 10px;">Connect Strava</button>
         <button class="icon-btn" id="refreshBtn" aria-label="Refresh">⟳</button>
       </div>
     </header>
@@ -96,6 +97,85 @@
         <div class="modal-footer">
           <button class="btn ghost" id="modalCancelBtn">Cancel</button>
           <button class="btn primary" id="modalSaveBtn">Save</button>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Auth Overlay -->
+    <div id="authOverlay" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal" style="max-width:420px;">
+        <div class="modal-header">
+          <div>
+            <div id="authTitle" class="modal-title">Login</div>
+            <div id="authMeta" class="modal-meta">Sign in to continue</div>
+          </div>
+        </div>
+        <div class="modal-body">
+          <label class="field"><span>Email</span><input id="authEmail" type="email" autocomplete="email" /></label>
+          <label class="field"><span id="authNameLabel" class="hidden">Display name</span><input id="authDisplayName" class="hidden" type="text" /></label>
+          <label class="field"><span>Password</span><input id="authPassword" type="password" autocomplete="current-password" /></label>
+          <button class="btn primary" id="authSubmitBtn" style="width:100%;">Login</button>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Plan Import Modal -->
+    <div id="planImportOverlay" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal" style="max-width:900px;">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">Add Plan (Import CSV)</div>
+            <div class="modal-meta">Upload CSV, preview mapping and issues, then import.</div>
+          </div>
+          <button class="icon-btn" id="planImportCloseBtn" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body">
+          <label class="field"><span>CSV File</span><input id="planImportFile" type="file" accept=".csv,text/csv" /></label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
+            <button class="btn ghost" id="planImportPreviewBtn">Preview</button>
+            <button class="btn primary" id="planImportCommitBtn" disabled>Import</button>
+          </div>
+          <div id="planImportSummary" class="hero-sub">No file loaded.</div>
+          <div id="planImportPreviewWrap" style="margin-top:10px; overflow:auto; max-height:300px;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Plan Generator Modal -->
+    <div id="planGenerateOverlay" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal" style="max-width:760px;">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">Create Plan (Generator)</div>
+            <div class="modal-meta">Generate a deterministic running plan and write to Plan sheet.</div>
+          </div>
+          <button class="icon-btn" id="planGenerateCloseBtn" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="row">
+            <label class="field"><span>Plan Name</span><input id="genPlanName" type="text" placeholder="Spring 10k" /></label>
+            <label class="field"><span>Target Distance (km)</span><input id="genTargetKm" type="number" step="0.1" value="10" /></label>
+          </div>
+          <div class="row">
+            <label class="field"><span>Plan Length (weeks)</span><input id="genLengthWeeks" type="number" step="1" value="12" /></label>
+            <label class="field"><span>Training Days / Week</span><input id="genDaysPerWeek" type="number" step="1" min="2" max="7" value="4" /></label>
+          </div>
+          <div class="row">
+            <label class="field"><span>Long Run Day</span>
+              <select id="genLongRunDay">
+                <option>MON</option><option>TUE</option><option>WED</option><option>THU</option><option>FRI</option><option>SAT</option><option selected>SUN</option>
+              </select>
+            </label>
+            <label class="field"><span>Start Date (optional)</span><input id="genStartDate" type="date" /></label>
+          </div>
+          <div class="row">
+            <label class="field"><span><input id="genIncludeIntervals" type="checkbox" checked /> Include intervals</span></label>
+            <label class="field"><span><input id="genIncludeTempo" type="checkbox" checked /> Include tempo</span></label>
+          </div>
+          <div style="display:flex; justify-content:flex-end; margin-top:8px;"><button class="btn primary" id="planGenerateCommitBtn">Generate & Save</button></div>
+          <div id="planGenerateSummary" class="hero-sub" style="margin-top:8px;"></div>
         </div>
       </div>
     </div>
