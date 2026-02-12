@@ -1,188 +1,374 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <base target="_top">
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <?!= include('styles'); ?>
-  </head>
-  <body>
-    <header class="topbar">
-      <div class="topbar-left">
-        <div class="avatar">J</div>
-        <div class="title-wrap">
-          <div class="app-title" id="appTitle">Training Planner</div>
-          <div class="app-sub" id="subTitle">Loading…</div>
-        </div>
-      </div>
+/********************************
+ * Strava OAuth + sync helpers
+ ********************************/
 
-      <div class="topbar-right" style="display:flex; gap:8px; align-items:center;">
-        <button class="btn ghost" id="connectStravaBtn" style="min-width:auto; padding:8px 10px;">Connect Strava</button>
-        <button class="icon-btn" id="refreshBtn" aria-label="Refresh">⟳</button>
-      </div>
-    </header>
+function apiGetStravaConnectUrl(args) {
+  const auth = requireSessionFromArgs_(args || {});
+  return { url: stravaAuthUrl_(auth.user.userId) };
+}
 
-    <main class="container">
-      <!-- TODAY -->
-      <section id="view-today" class="view"></section>
+function apiDisconnectStrava(args) {
+  const auth = requireSessionFromArgs_(args || {});
+  setStravaConnected_(auth.user.userId, false);
+  return { ok: true };
+}
 
-      <!-- PLAN -->
-      <section id="view-plan" class="view hidden"></section>
+function apiGetStravaStatus(args) {
+  const auth = requireSessionFromArgs_(args || {});
+  return getStravaConnectionStatus_(auth.user.userId);
+}
 
-      <!-- ACTIVITIES -->
-      <section id="view-activities" class="view hidden"></section>
+function isStravaOAuthCallback_(e) {
+  return String((e.parameter || {}).route || '') === 'stravaCallback';
+}
 
-      <!-- STATS -->
-      <section id="view-stats" class="view hidden"></section>
-    </main>
+function handleStravaOAuthCallback_(e) {
+  try {
+    const statePayload = parseSignedState_((e.parameter || {}).state || '');
+    const userId = statePayload.userId;
+    const code = String((e.parameter || {}).code || '');
+    if (!userId || !code) throw new Error('Missing state/code');
 
-    <!-- Bottom Nav -->
-    <nav class="bottom-nav" role="navigation" aria-label="Bottom navigation">
-      <button class="nav-item active" data-view="today">
-        <div class="nav-ico">☀</div>
-         <div class="nav-txt">Week</div>
-      </button>
-      <button class="nav-item" data-view="plan">
-        <div class="nav-ico">📅</div>
-        <div class="nav-txt">Plan</div>
-      </button>
-      <button class="nav-item" data-view="activities">
-        <div class="nav-ico">📈</div>
-        <div class="nav-txt">Activities</div>
-      </button>
-      <button class="nav-item" data-view="stats">
-        <div class="nav-ico">🏅</div>
-        <div class="nav-txt">Stats</div>
-      </button>
-    </nav>
+    const tokenResp = exchangeStravaCode_(code);
+    upsertStravaAccount_(userId, tokenResp);
+    syncUserActivities_(userId, { fullBackfill: true, maxPages: 3 });
 
-    <!-- Modal -->
-    <div id="modalOverlay" class="modal-overlay hidden" aria-hidden="true">
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-        <div class="modal-header">
-          <div>
-            <div id="modalTitle" class="modal-title">Edit session</div>
-            <div id="modalMeta" class="modal-meta"></div>
-          </div>
-          <button class="icon-btn" id="modalCloseBtn" aria-label="Close">✕</button>
-        </div>
+    return HtmlService.createHtmlOutput('<html><body style="font-family:sans-serif;padding:16px;">Strava connected. You can close this tab and return to the app.</body></html>');
+  } catch (err) {
+    return HtmlService.createHtmlOutput('<html><body style="font-family:sans-serif;padding:16px;">Strava connect failed: ' + escHtml_(err.message) + '</body></html>');
+  }
+}
 
-        <div class="modal-body">
-          <label class="field">
-            <span>Status</span>
-            <select id="editStatus">
-              <option value="DONE">Done</option>
-              <option value="PARTIAL">Partial</option>
-              <option value="SKIPPED">Skipped</option>
-            </select>
-          </label>
+function stravaAuthUrl_(userId) {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = props.getProperty('STRAVA_CLIENT_ID');
+  const base = props.getProperty('WEBAPP_BASE_URL');
+  if (!clientId || !base) throw new Error('Missing STRAVA_CLIENT_ID or WEBAPP_BASE_URL script properties');
 
-          <div class="row">
-            <label class="field">
-              <span>Actual km</span>
-              <input id="editKm" type="number" inputmode="decimal" step="0.1" />
-            </label>
+  const state = signState_({ userId, ts: Date.now() });
+  const redirectUri = base + '?route=stravaCallback';
+  const params = {
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    approval_prompt: 'auto',
+    scope: 'activity:read_all',
+    state
+  };
+  return 'https://www.strava.com/oauth/authorize?' + toQuery_(params);
+}
 
-            <label class="field">
-              <span>Actual min</span>
-              <input id="editMin" type="number" inputmode="numeric" step="1" />
-            </label>
-          </div>
+function exchangeStravaCode_(code) {
+  const props = PropertiesService.getScriptProperties();
+  const payload = {
+    client_id: props.getProperty('STRAVA_CLIENT_ID'),
+    client_secret: props.getProperty('STRAVA_CLIENT_SECRET'),
+    code,
+    grant_type: 'authorization_code'
+  };
+  const resp = UrlFetchApp.fetch('https://www.strava.com/oauth/token', { method: 'post', payload, muteHttpExceptions: true });
+  const json = JSON.parse(resp.getContentText() || '{}');
+  if (resp.getResponseCode() >= 300) throw new Error('Strava token exchange failed: ' + resp.getContentText());
+  return json;
+}
 
-          <label class="field">
-            <span>Notes</span>
-            <textarea id="editNotes" rows="3" placeholder="Optional…"></textarea>
-          </label>
-        </div>
+function stravaEnsureAccessToken_(userId) {
+  const acct = getStravaAccountByUserId_(userId);
+  if (!acct || !isTruthy_(acct.connected)) throw new Error('Strava not connected');
 
-        <div class="modal-footer">
-          <button class="btn ghost" id="modalCancelBtn">Cancel</button>
-          <button class="btn primary" id="modalSaveBtn">Save</button>
-        </div>
-      </div>
-    </div>
+  const nowSec = Math.floor(Date.now() / 1000);
+  const exp = Number(acct.expiresAt || 0);
+  if (exp > nowSec + 120) return acct.accessToken;
 
+  const props = PropertiesService.getScriptProperties();
+  const payload = {
+    client_id: props.getProperty('STRAVA_CLIENT_ID'),
+    client_secret: props.getProperty('STRAVA_CLIENT_SECRET'),
+    grant_type: 'refresh_token',
+    refresh_token: acct.refreshToken
+  };
+  const resp = UrlFetchApp.fetch('https://www.strava.com/oauth/token', { method: 'post', payload, muteHttpExceptions: true });
+  if (resp.getResponseCode() >= 300) throw new Error('Strava refresh failed: ' + resp.getContentText());
+  const json = JSON.parse(resp.getContentText() || '{}');
+  upsertStravaAccount_(userId, json);
+  return json.access_token;
+}
 
-    <!-- Auth Overlay -->
-    <div id="authOverlay" class="modal-overlay hidden" aria-hidden="true">
-      <div class="modal" style="max-width:420px;">
-        <div class="modal-header">
-          <div>
-            <div id="authTitle" class="modal-title">Login</div>
-            <div id="authMeta" class="modal-meta">Sign in to continue</div>
-          </div>
-        </div>
-        <div class="modal-body">
-          <label class="field"><span>Email</span><input id="authEmail" type="email" autocomplete="email" /></label>
-          <label class="field"><span id="authNameLabel" class="hidden">Display name</span><input id="authDisplayName" class="hidden" type="text" /></label>
-          <label class="field"><span>Password</span><input id="authPassword" type="password" autocomplete="current-password" /></label>
-          <button class="btn primary" id="authSubmitBtn" style="width:100%;">Login</button>
-        </div>
-      </div>
-    </div>
+function stravaApiGet_(accessToken, path, params) {
+  const url = 'https://www.strava.com/api/v3' + path + (params ? ('?' + toQuery_(params)) : '');
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + accessToken }
+  });
+  if (resp.getResponseCode() >= 300) throw new Error('Strava API error ' + resp.getResponseCode() + ': ' + resp.getContentText());
+  return JSON.parse(resp.getContentText() || '{}');
+}
 
+function stravaGetActivity_(userId, activityId) {
+  const token = stravaEnsureAccessToken_(userId);
+  return stravaApiGet_(token, '/activities/' + activityId, null);
+}
 
-    <!-- Plan Import Modal -->
-    <div id="planImportOverlay" class="modal-overlay hidden" aria-hidden="true">
-      <div class="modal" style="max-width:900px;">
-        <div class="modal-header">
-          <div>
-            <div class="modal-title">Add Plan (Import CSV)</div>
-            <div class="modal-meta">Upload CSV, preview mapping and issues, then import.</div>
-          </div>
-          <button class="icon-btn" id="planImportCloseBtn" aria-label="Close">✕</button>
-        </div>
-        <div class="modal-body">
-          <label class="field"><span>CSV File</span><input id="planImportFile" type="file" accept=".csv,text/csv" /></label>
-          <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
-            <button class="btn ghost" id="planImportPreviewBtn">Preview</button>
-            <button class="btn primary" id="planImportCommitBtn" disabled>Import</button>
-          </div>
-          <div id="planImportSummary" class="hero-sub">No file loaded.</div>
-          <div id="planImportPreviewWrap" style="margin-top:10px; overflow:auto; max-height:300px;"></div>
-        </div>
-      </div>
-    </div>
+function stravaListActivities_(userId, page, perPage, after, before) {
+  const token = stravaEnsureAccessToken_(userId);
+  const params = { page: Number(page || 1), per_page: Number(perPage || 200) };
+  if (after) params.after = Number(after);
+  if (before) params.before = Number(before);
+  return stravaApiGet_(token, '/athlete/activities', params);
+}
 
-    <!-- Plan Generator Modal -->
-    <div id="planGenerateOverlay" class="modal-overlay hidden" aria-hidden="true">
-      <div class="modal" style="max-width:760px;">
-        <div class="modal-header">
-          <div>
-            <div class="modal-title">Create Plan (Generator)</div>
-            <div class="modal-meta">Generate a deterministic running plan and write to Plan sheet.</div>
-          </div>
-          <button class="icon-btn" id="planGenerateCloseBtn" aria-label="Close">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="row">
-            <label class="field"><span>Plan Name</span><input id="genPlanName" type="text" placeholder="Spring 10k" /></label>
-            <label class="field"><span>Target Distance (km)</span><input id="genTargetKm" type="number" step="0.1" value="10" /></label>
-          </div>
-          <div class="row">
-            <label class="field"><span>Plan Length (weeks)</span><input id="genLengthWeeks" type="number" step="1" value="12" /></label>
-            <label class="field"><span>Training Days / Week</span><input id="genDaysPerWeek" type="number" step="1" min="2" max="7" value="4" /></label>
-          </div>
-          <div class="row">
-            <label class="field"><span>Long Run Day</span>
-              <select id="genLongRunDay">
-                <option>MON</option><option>TUE</option><option>WED</option><option>THU</option><option>FRI</option><option>SAT</option><option selected>SUN</option>
-              </select>
-            </label>
-            <label class="field"><span>Start Date (optional)</span><input id="genStartDate" type="date" /></label>
-          </div>
-          <div class="row">
-            <label class="field"><span><input id="genIncludeIntervals" type="checkbox" checked /> Include intervals</span></label>
-            <label class="field"><span><input id="genIncludeTempo" type="checkbox" checked /> Include tempo</span></label>
-          </div>
-          <div style="display:flex; justify-content:flex-end; margin-top:8px;"><button class="btn primary" id="planGenerateCommitBtn">Generate & Save</button></div>
-          <div id="planGenerateSummary" class="hero-sub" style="margin-top:8px;"></div>
-        </div>
-      </div>
-    </div>
+function syncCatchUp_() {
+  initTables_();
+  const accounts = listStravaAccounts_().filter(a => isTruthy_(a.connected));
+  accounts.forEach(a => syncUserActivities_(a.userId, { incremental: true, maxPages: 3 }));
+}
 
-    <!-- Toast -->
-    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+function syncUserActivities_(userId, opts) {
+  opts = opts || {};
+  const acct = getStravaAccountByUserId_(userId);
+  if (!acct || !isTruthy_(acct.connected)) return;
 
-    <?!= include('app'); ?>
-  </body>
-</html>
+  let page = Number(acct.backfillPage || 1);
+  const maxPages = Number(opts.maxPages || 10);
+  let after = opts.incremental ? Number(acct.lastSyncAfter || 0) : 0;
+  if (opts.fullBackfill) {
+    page = 1;
+    after = 0;
+  }
+
+  let processed = 0;
+  let newest = Number(acct.lastSyncAfter || 0);
+
+  for (let i = 0; i < maxPages; i++) {
+    const rows = stravaListActivities_(userId, page, 200, after, null);
+    if (!rows || !rows.length) {
+      setBackfillState_(userId, page, true, newest);
+      break;
+    }
+    rows.forEach(a => {
+      upsertActivityFromStrava_(userId, Number(acct.stravaAthleteId || 0), a, false);
+      upsertLogFromStravaActivity_(userId, a);
+      const st = toEpochSec_(a.start_date || a.start_date_local);
+      if (st > newest) newest = st;
+      processed++;
+    });
+    page += 1;
+  }
+
+  if (processed > 0) setBackfillState_(userId, page, false, newest);
+}
+
+function upsertActivityFromStrava_(userId, athleteId, activity, deletedFlag) {
+  initTables_();
+  const sh = getSheet_('Activities');
+  const data = sh.getDataRange().getValues();
+  const h = headerMap_(data[0]);
+  const id = String(activity.id || activity.object_id || '');
+  if (!id) return;
+
+  const rowObj = {
+    stravaActivityId: id,
+    userId,
+    athleteId: athleteId || Number((activity.athlete || {}).id || 0),
+    startDate: activity.start_date || activity.start_date_local || '',
+    type: activity.type || '',
+    name: activity.name || '',
+    distanceM: Number(activity.distance || 0),
+    movingTimeS: Number(activity.moving_time || 0),
+    elapsedTimeS: Number(activity.elapsed_time || 0),
+    totalElevationGainM: Number(activity.total_elevation_gain || 0),
+    averageHeartrate: Number(activity.average_heartrate || 0),
+    maxHeartrate: Number(activity.max_heartrate || 0),
+    averageSpeed: Number(activity.average_speed || 0),
+    summaryPolyline: ((activity.map || {}).summary_polyline || ''),
+    rawJson: JSON.stringify(activity).slice(0, 45000),
+    deleted: !!deletedFlag,
+    updatedAt: new Date()
+  };
+
+  let found = -1;
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][h.stravaActivityId] || '') === id) { found = r + 1; break; }
+  }
+
+  const vals = ACTIVITY_HEADERS_.map(k => rowObj[k] == null ? '' : rowObj[k]);
+  if (found < 0) sh.appendRow(vals);
+  else sh.getRange(found, 1, 1, vals.length).setValues([vals]);
+}
+
+function upsertLogFromStravaActivity_(userId, activity) {
+  const match = matchPlanForActivity_(activity);
+  const km = Number(activity.distance || 0) / 1000;
+  const min = Math.round(Number(activity.moving_time || 0) / 60);
+  upsertLog_({
+    PlanID: match.planId,
+    Status: 'DONE',
+    ActualKm: km,
+    ActualMin: min,
+    CompletedAt: new Date(activity.start_date || activity.start_date_local || new Date()),
+    LogNotes: 'Imported from Strava: ' + String(activity.name || 'Activity'),
+    UserId: userId,
+    Source: 'strava',
+    StravaActivityId: String(activity.id || ''),
+    SportType: String(activity.type || ''),
+    ImportedAt: new Date(),
+    PlanMatchConfidence: match.confidence,
+    PlanMatchReason: match.reason
+  });
+}
+
+function matchPlanForActivity_(activity) {
+  const settings = getSettings_();
+  const tz = settings.Timezone || Session.getScriptTimeZone();
+  const dateISO = toIsoDate_(activity.start_date_local || activity.start_date, tz);
+  if (!dateISO) return { planId: 'UNPLANNED', confidence: 0, reason: 'no_date' };
+
+  const candidates = readPlanBetween_(dateISO, dateISO, tz);
+  if (!candidates.length) return { planId: 'UNPLANNED', confidence: 0, reason: 'no_plan_on_date' };
+
+  const type = String(activity.type || '').toLowerCase();
+  const bySport = candidates.filter(c => String(c.Sport || '').toLowerCase().includes(type) || type.includes(String(c.Sport || '').toLowerCase()));
+  if (bySport.length) return { planId: bySport[0].PlanID, confidence: 0.9, reason: 'same_day_sport' };
+  return { planId: candidates[0].PlanID, confidence: 0.5, reason: 'same_day_nearest' };
+}
+
+function getStravaConnectionStatus_(userId) {
+  const acct = getStravaAccountByUserId_(userId);
+  if (!acct) return { connected: false };
+  return {
+    connected: isTruthy_(acct.connected),
+    athleteId: acct.stravaAthleteId || '',
+    expiresAt: acct.expiresAt || '',
+    scope: acct.scope || ''
+  };
+}
+
+function upsertStravaAccount_(userId, tokenResp) {
+  initTables_();
+  const athleteId = Number(((tokenResp.athlete || {}).id) || tokenResp.athlete_id || 0);
+  const rowObj = {
+    userId,
+    stravaAthleteId: athleteId,
+    accessToken: tokenResp.access_token,
+    refreshToken: tokenResp.refresh_token,
+    expiresAt: Number(tokenResp.expires_at || 0),
+    scope: tokenResp.scope || '',
+    connected: true,
+    lastSyncAfter: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    backfillPage: 1,
+    backfillDone: false
+  };
+
+  const sh = getSheet_('StravaAccounts');
+  const data = sh.getDataRange().getValues();
+  const h = headerMap_(data[0]);
+  let found = -1;
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][h.userId] || '') === String(userId)) { found = r + 1; break; }
+  }
+  const vals = STRAVA_ACCOUNT_HEADERS_.map(k => rowObj[k] == null ? '' : rowObj[k]);
+  if (found < 0) sh.appendRow(vals);
+  else sh.getRange(found, 1, 1, vals.length).setValues([vals]);
+}
+
+function setStravaConnected_(userId, connected) {
+  const sh = getSheet_('StravaAccounts');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return;
+  const h = headerMap_(data[0]);
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][h.userId] || '') === String(userId)) {
+      sh.getRange(r + 1, h.connected + 1).setValue(!!connected);
+      sh.getRange(r + 1, h.updatedAt + 1).setValue(new Date());
+      return;
+    }
+  }
+}
+
+function setBackfillState_(userId, page, done, lastSyncAfter) {
+  const sh = getSheet_('StravaAccounts');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return;
+  const h = headerMap_(data[0]);
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][h.userId] || '') === String(userId)) {
+      writeIfHeader_(sh, r + 1, h, 'backfillPage', page);
+      writeIfHeader_(sh, r + 1, h, 'backfillDone', !!done);
+      writeIfHeader_(sh, r + 1, h, 'lastSyncAfter', Number(lastSyncAfter || 0));
+      writeIfHeader_(sh, r + 1, h, 'updatedAt', new Date());
+      return;
+    }
+  }
+}
+
+function getStravaAccountByUserId_(userId) {
+  return listStravaAccounts_().find(a => String(a.userId) === String(userId)) || null;
+}
+
+function getStravaAccountByAthleteId_(athleteId) {
+  return listStravaAccounts_().find(a => String(a.stravaAthleteId) === String(athleteId)) || null;
+}
+
+function listStravaAccounts_() {
+  const data = getSheet_('StravaAccounts').getDataRange().getValues();
+  if (data.length < 2) return [];
+  const h = headerMap_(data[0]);
+  return data.slice(1).filter(r => String(r[h.userId] || '').trim()).map(r => rowToObj_(h, r));
+}
+
+function signState_(payload) {
+  const body = Utilities.base64EncodeWebSafe(JSON.stringify(payload));
+  const secret = String(PropertiesService.getScriptProperties().getProperty('AUTH_SALT') || 'change-me');
+  const sigBytes = Utilities.computeHmacSha256Signature(body, secret);
+  const sig = Utilities.base64EncodeWebSafe(sigBytes);
+  return body + '.' + sig;
+}
+
+function parseSignedState_(state) {
+  const [body, sig] = String(state || '').split('.');
+  if (!body || !sig) throw new Error('Invalid OAuth state');
+  const secret = String(PropertiesService.getScriptProperties().getProperty('AUTH_SALT') || 'change-me');
+  const expected = Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(body, secret));
+  if (expected !== sig) throw new Error('State signature mismatch');
+  const payload = JSON.parse(Utilities.newBlob(Utilities.base64DecodeWebSafe(body)).getDataAsString());
+  if (Date.now() - Number(payload.ts || 0) > 15 * 60 * 1000) throw new Error('State expired');
+  return payload;
+}
+
+function toQuery_(obj) {
+  return Object.keys(obj).filter(k => obj[k] !== '' && obj[k] != null).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(obj[k]))).join('&');
+}
+
+function toEpochSec_(iso) {
+  if (!iso) return 0;
+  const d = new Date(iso);
+  return Math.floor(d.getTime() / 1000);
+}
+
+function escHtml_(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function installStravaTriggers_() {
+  const fnNames = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
+  if (!fnNames.includes('processWebhookQueue_')) {
+    ScriptApp.newTrigger('processWebhookQueue_').timeBased().everyMinutes(5).create();
+  }
+  if (!fnNames.includes('syncCatchUp_')) {
+    ScriptApp.newTrigger('syncCatchUp_').timeBased().everyHours(1).create();
+  }
+}
+
+function setupInstructions_() {
+  return [
+    'Setup steps:',
+    '1) In Script Properties set STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN, WEBAPP_BASE_URL, AUTH_SALT.',
+    '2) Deploy web app and set WEBAPP_BASE_URL to that deployment URL.',
+    '3) Configure Strava app callback URL: WEBAPP_BASE_URL?route=stravaCallback.',
+    '4) Create Strava webhook subscription pointing to WEBAPP_BASE_URL (same endpoint).',
+    '5) Run initTables_() and installStravaTriggers_() once as admin.'
+  ].join('\n');
+}
