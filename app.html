@@ -9,7 +9,9 @@
     currentView: 'today',
     modal: { open: false, item: null },
     auth: { sessionToken: localStorage.getItem('sessionToken') || null, user: null, needsSetup: false, strava: null },
-    planImport: { headers: [], rows: [], preview: null }
+    planImport: { headers: [], rows: [], preview: null },
+    activities: { items: [] },
+    statsUi: { rangeWeeks: 12, granularity: 'week' }
   };
 
   const el = (id) => document.getElementById(id);
@@ -134,9 +136,36 @@
         state.auth.sessionToken = res.sessionToken;
         localStorage.setItem('sessionToken', state.auth.sessionToken);
         hideAuthOverlay();
+        hideResetPasswordPanel();
         await checkAuthAndStart();
       } catch (err) {
-        toast('Login failed');
+        const msg = String(err && err.message || '').replace('Error: ', '');
+        toast(msg ? `Login failed: ${msg}` : 'Login failed');
+      }
+    });
+
+    el('authResetToggleBtn').addEventListener('click', () => {
+      const showing = !el('authResetPanel').classList.contains('hidden');
+      if (showing) hideResetPasswordPanel();
+      else showResetPasswordPanel();
+    });
+
+    el('authResetSubmitBtn').addEventListener('click', async () => {
+      const email = String(el('authResetEmail').value || '').trim();
+      const newPassword = String(el('authResetPassword').value || '');
+      if (!email || !newPassword) {
+        toast('Enter email and new password');
+        return;
+      }
+      try {
+        await callRaw('apiResetPassword', { email, newPassword });
+        toast('Password reset. Please login.');
+        hideResetPasswordPanel();
+        el('authEmail').value = email;
+        el('authPassword').value = '';
+      } catch (err) {
+        const msg = String(err && err.message || '').replace('Error: ', '');
+        toast(msg ? `Reset failed: ${msg}` : 'Reset failed');
       }
     });
   }
@@ -147,10 +176,14 @@
     el('authMeta').textContent = needsSetup ? 'First run setup' : 'Sign in to continue';
     el('authNameLabel').classList.toggle('hidden', !needsSetup);
     el('authDisplayName').classList.toggle('hidden', !needsSetup);
+    el('authResetToggleBtn').classList.toggle('hidden', !!needsSetup);
+    if (needsSetup) hideResetPasswordPanel();
     el('authOverlay').classList.remove('hidden');
   }
 
   function hideAuthOverlay(){ el('authOverlay').classList.add('hidden'); }
+ function showResetPasswordPanel(){ el('authResetPanel').classList.remove('hidden'); }
+  function hideResetPasswordPanel(){ el('authResetPanel').classList.add('hidden'); }
 
   function updateStravaButton(){
     const b = el('connectStravaBtn');
@@ -338,34 +371,29 @@
   async function bootstrapAll(force){
     setSubtitle('Loading…');
 
-    // Load rolling first (drives Today + Plan)
-    google.script.run
-      .withSuccessHandler(res => {
-        state.settings = res.settings;
-        state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
+    try {
+      const res = await apiCall('apiBootstrap', {});
+      state.settings = res.settings;
+      state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
 
-        setSubtitle('Your training week');
-refreshStravaStatus();
+      setSubtitle('Your training week');
+      refreshStravaStatus();
 
-        apiCall('apiListPlan', {})
-          .then(planRes => {
-            state.planItems = planRes?.items || [];
-            renderActive();
-          })
-          .catch(err => console.error(err));
+      const [planRes, activitiesRes] = await Promise.all([
+        apiCall('apiListPlan', {}),
+        apiCall('apiListActivities', { limit: 200 })
+      ]);
+      state.planItems = planRes?.items || [];
+      state.activities.items = activitiesRes?.items || [];
 
-        // Load week + stats in background (non-blocking)
-        bootstrapWeek(todayIsoLocal());
-        bootstrapStats();
-
-        renderActive();
-      })
-      .withFailureHandler(err => {
-        console.error(err);
-        setSubtitle('Load failed');
-        toast('Load failed');
-      })
-      .apiBootstrap(withSession({}));
+      bootstrapWeek(todayIsoLocal());
+      bootstrapStats();
+      renderActive();
+    } catch (err) {
+      console.error(err);
+      setSubtitle('Load failed');
+      toast('Load failed');
+    }
   }
 
   function bootstrapWeek(anchorDate){
@@ -390,7 +418,7 @@ refreshStravaStatus();
   function bootstrapStats(){
      const today = todayIsoLocal();
     const from = new Date();
-    from.setDate(from.getDate()-30);
+    from.setDate(from.getDate() - (state.statsUi.rangeWeeks * 7));
     const dateFrom = localDateISO(from);
 
     google.script.run
@@ -399,7 +427,7 @@ refreshStravaStatus();
         if (state.currentView === 'stats' || state.currentView === 'today') renderActive();
       })
       .withFailureHandler(err => console.error(err))
-       .apiComputeStats(withSession({ dateFrom, dateTo: today }));
+     apiComputeStats(withSession({ dateFrom, dateTo: today, granularity: state.statsUi.granularity }));
   }
 
   /** -------------------------
@@ -458,10 +486,10 @@ refreshStravaStatus();
 
        <div class="section-title">Add activity</div>
       <div class="tile-grid">
-        <div class="tile run" data-add=" run"><small>Add</small>Run</div>
-        <div class="tile swim" data-add=" swim"><small>Add</small>Swim</div>
-        <div class="tile bike" data-add=" bike"><small>Add</small>Bike</div>
-        <div class="tile workout" data-add=" workout"><small>Add</small>Workout</div>
+        <div class="tile run" data-add="run"><small>Add</small><span>Run</span></div>
+        <div class="tile swim" data-add="swim"><small>Add</small><span>Swim</span></div>
+        <div class="tile bike" data-add="bike"><small>Add</small><span>Bike</span></div>
+        <div class="tile workout" data-add="workout"><small>Add</small><span>Workout</span></div>
       </div>
 
       <div class="section-title">Streaks</div>
@@ -570,22 +598,39 @@ refreshStravaStatus();
   function renderActivities(){
     const root = el('view-activities');
 
-    // Activities = any item with log status DONE/PARTIAL/SKIPPED
-     const all = (state.planItems || []).slice();
-    const done = all
-      .filter(it => it.Log && it.Log.Status && it.Log.Status !== 'PLANNED')
-      .sort((a,b) => (b.Date.localeCompare(a.Date)));
+   const acts = (state.activities.items || []).slice();
 
     root.innerHTML = `
       <div class="section-title">Activities</div>
       <div class="card">
-          ${done.length ? done.map(it => renderSessionRow(it, { showDate:true, allowDone:false })).join('') :
-          `<div class="card-pad"><div class="hero-sub">No completed sessions yet. Mark something done.</div></div>`
+          ${acts.length ? acts.map(renderActivityRow).join('') :
+          `<div class="card-pad"><div class="hero-sub">No synced activities yet. Connect Strava and run backfill.</div></div>`
         }
       </div>
     `;
+}
 
-    wireSessions(root);
+    function renderActivityRow(it){
+    const km = num(it.distanceM) / 1000;
+    const min = Math.round(num(it.movingTimeS) / 60);
+    const elev = fmt0(num(it.totalElevationGainM));
+    const dateLabel = formatDateWithDay(String(it.startDate || '').slice(0, 10));
+    const details = [
+      it.type || 'Activity',
+      km ? `${fmt1(km)} km` : '',
+      min ? `${fmt0(min)} min` : '',
+      elev && elev !== '0' ? `${elev} m↑` : ''
+    ].filter(Boolean).join(' • ');
+    const title = it.name || it.type || 'Activity';
+    return `
+      <div class="session" style="cursor:default;">
+        <div class="dot" style="background:${workoutColor({ Sport: it.type })};"></div>
+        <div class="session-main">
+          <div class="session-title">${esc(title)}</div>
+          <div class="session-sub">${esc(`${dateLabel} • ${details}`)}</div>
+        </div>
+      </div>
+    `;
   }
 
   /** -------------------------
@@ -601,6 +646,27 @@ refreshStravaStatus();
 
     root.innerHTML = `
       <div class="section-title">Stats</div>
+
+<div class="card" style="margin-bottom:12px;">
+        <div class="card-pad" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+          <label class="field" style="margin:0; min-width:220px;">
+            <span>Range</span>
+            <select id="statsRangeSel">
+              <option value="4" ${state.statsUi.rangeWeeks === 4 ? 'selected' : ''}>Last 4 weeks</option>
+              <option value="12" ${state.statsUi.rangeWeeks === 12 ? 'selected' : ''}>Last 12 weeks</option>
+              <option value="26" ${state.statsUi.rangeWeeks === 26 ? 'selected' : ''}>Last 26 weeks</option>
+              <option value="52" ${state.statsUi.rangeWeeks === 52 ? 'selected' : ''}>Last 52 weeks</option>
+            </select>
+          </label>
+          <label class="field" style="margin:0; min-width:220px;">
+            <span>Group by</span>
+            <select id="statsGranularitySel">
+              <option value="week" ${state.statsUi.granularity === 'week' ? 'selected' : ''}>Per week</option>
+              <option value="month" ${state.statsUi.granularity === 'month' ? 'selected' : ''}>Per month</option>
+            </select>
+          </label>
+        </div>
+      </div>
 
       <div class="card">
         <div class="card-pad">
@@ -627,11 +693,46 @@ refreshStravaStatus();
             <div class="kpi" style="flex:1 1 220px;">
               <div class="k">Km this year</div>
               <div class="v">${fmt1(res?.kmSummary?.yearDoneKm || 0)}</div>
-      </div>
-      </div>
+       </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="k" style="font-size:28px; color:var(--muted); font-weight:900;">Distance trend</div>
+            ${renderTrendChart(res?.distanceTrend || [], state.statsUi.granularity)}
+          </div>
         </div>
       </div>
     `;
+  
+    el('statsRangeSel')?.addEventListener('change', (e) => {
+      state.statsUi.rangeWeeks = Number(e.target.value || 12);
+      bootstrapStats();
+    });
+    el('statsGranularitySel')?.addEventListener('change', (e) => {
+      state.statsUi.granularity = e.target.value || 'week';
+      bootstrapStats();
+    });
+  }
+
+  function renderTrendChart(points, granularity){
+    if (!points || !points.length) {
+      return `<div class="hero-sub">No distance data in selected range.</div>`;
+    }
+    const maxKm = Math.max(...points.map(p => num(p.km)), 1);
+    const bars = points.map(p => {
+      const height = Math.max(6, Math.round((num(p.km) / maxKm) * 120));
+      const label = granularity === 'month' ? String(p.label || '').slice(2) : String(p.label || '').slice(5);
+      return `
+        <div style="flex:1 1 0; min-width:28px; text-align:center;">
+          <div style="height:130px; display:flex; align-items:flex-end; justify-content:center;">
+            <div title="${esc(p.label)}: ${fmt1(num(p.km))} km" style="width:100%; max-width:34px; height:${height}px; border-radius:8px 8px 4px 4px; background:linear-gradient(180deg, rgba(59,130,246,.95), rgba(37,99,235,.85));"></div>
+          </div>
+          <div style="font-size:20px; color:var(--muted); margin-top:4px;">${esc(label)}</div>
+          <div style="font-size:20px;">${fmt1(num(p.km))}</div>
+        </div>
+      `;
+    }).join('');
+    return `<div style="display:flex; gap:8px; align-items:flex-end; overflow:auto; padding-top:8px;">${bars}</div>`;
   }
 
   /** -------------------------
