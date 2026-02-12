@@ -1,374 +1,936 @@
-/********************************
- * Strava OAuth + sync helpers
- ********************************/
-
-function apiGetStravaConnectUrl(args) {
-  const auth = requireSessionFromArgs_(args || {});
-  return { url: stravaAuthUrl_(auth.user.userId) };
-}
-
-function apiDisconnectStrava(args) {
-  const auth = requireSessionFromArgs_(args || {});
-  setStravaConnected_(auth.user.userId, false);
-  return { ok: true };
-}
-
-function apiGetStravaStatus(args) {
-  const auth = requireSessionFromArgs_(args || {});
-  return getStravaConnectionStatus_(auth.user.userId);
-}
-
-function isStravaOAuthCallback_(e) {
-  return String((e.parameter || {}).route || '') === 'stravaCallback';
-}
-
-function handleStravaOAuthCallback_(e) {
-  try {
-    const statePayload = parseSignedState_((e.parameter || {}).state || '');
-    const userId = statePayload.userId;
-    const code = String((e.parameter || {}).code || '');
-    if (!userId || !code) throw new Error('Missing state/code');
-
-    const tokenResp = exchangeStravaCode_(code);
-    upsertStravaAccount_(userId, tokenResp);
-    syncUserActivities_(userId, { fullBackfill: true, maxPages: 3 });
-
-    return HtmlService.createHtmlOutput('<html><body style="font-family:sans-serif;padding:16px;">Strava connected. You can close this tab and return to the app.</body></html>');
-  } catch (err) {
-    return HtmlService.createHtmlOutput('<html><body style="font-family:sans-serif;padding:16px;">Strava connect failed: ' + escHtml_(err.message) + '</body></html>');
-  }
-}
-
-function stravaAuthUrl_(userId) {
-  const props = PropertiesService.getScriptProperties();
-  const clientId = props.getProperty('STRAVA_CLIENT_ID');
-  const base = props.getProperty('WEBAPP_BASE_URL');
-  if (!clientId || !base) throw new Error('Missing STRAVA_CLIENT_ID or WEBAPP_BASE_URL script properties');
-
-  const state = signState_({ userId, ts: Date.now() });
-  const redirectUri = base + '?route=stravaCallback';
-  const params = {
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: 'code',
-    approval_prompt: 'auto',
-    scope: 'activity:read_all',
-    state
+<script>
+  const state = {
+    settings: null,
+    rolling: { dateFrom: null, dateTo: null, items: [] },
+    planItems: [],
+    week: { weekStart: null, weekEnd: null, items: [], totals: null },
+    stats: null,
+       weekAnchorDate: null,
+    currentView: 'today',
+    modal: { open: false, item: null },
+    auth: { sessionToken: localStorage.getItem('sessionToken') || null, user: null, needsSetup: false, strava: null },
+    planImport: { headers: [], rows: [], preview: null }
   };
-  return 'https://www.strava.com/oauth/authorize?' + toQuery_(params);
-}
 
-function exchangeStravaCode_(code) {
-  const props = PropertiesService.getScriptProperties();
-  const payload = {
-    client_id: props.getProperty('STRAVA_CLIENT_ID'),
-    client_secret: props.getProperty('STRAVA_CLIENT_SECRET'),
-    code,
-    grant_type: 'authorization_code'
-  };
-  const resp = UrlFetchApp.fetch('https://www.strava.com/oauth/token', { method: 'post', payload, muteHttpExceptions: true });
-  const json = JSON.parse(resp.getContentText() || '{}');
-  if (resp.getResponseCode() >= 300) throw new Error('Strava token exchange failed: ' + resp.getContentText());
-  return json;
-}
+  const el = (id) => document.getElementById(id);
 
-function stravaEnsureAccessToken_(userId) {
-  const acct = getStravaAccountByUserId_(userId);
-  if (!acct || !isTruthy_(acct.connected)) throw new Error('Strava not connected');
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  const exp = Number(acct.expiresAt || 0);
-  if (exp > nowSec + 120) return acct.accessToken;
-
-  const props = PropertiesService.getScriptProperties();
-  const payload = {
-    client_id: props.getProperty('STRAVA_CLIENT_ID'),
-    client_secret: props.getProperty('STRAVA_CLIENT_SECRET'),
-    grant_type: 'refresh_token',
-    refresh_token: acct.refreshToken
-  };
-  const resp = UrlFetchApp.fetch('https://www.strava.com/oauth/token', { method: 'post', payload, muteHttpExceptions: true });
-  if (resp.getResponseCode() >= 300) throw new Error('Strava refresh failed: ' + resp.getContentText());
-  const json = JSON.parse(resp.getContentText() || '{}');
-  upsertStravaAccount_(userId, json);
-  return json.access_token;
-}
-
-function stravaApiGet_(accessToken, path, params) {
-  const url = 'https://www.strava.com/api/v3' + path + (params ? ('?' + toQuery_(params)) : '');
-  const resp = UrlFetchApp.fetch(url, {
-    method: 'get',
-    muteHttpExceptions: true,
-    headers: { Authorization: 'Bearer ' + accessToken }
-  });
-  if (resp.getResponseCode() >= 300) throw new Error('Strava API error ' + resp.getResponseCode() + ': ' + resp.getContentText());
-  return JSON.parse(resp.getContentText() || '{}');
-}
-
-function stravaGetActivity_(userId, activityId) {
-  const token = stravaEnsureAccessToken_(userId);
-  return stravaApiGet_(token, '/activities/' + activityId, null);
-}
-
-function stravaListActivities_(userId, page, perPage, after, before) {
-  const token = stravaEnsureAccessToken_(userId);
-  const params = { page: Number(page || 1), per_page: Number(perPage || 200) };
-  if (after) params.after = Number(after);
-  if (before) params.before = Number(before);
-  return stravaApiGet_(token, '/athlete/activities', params);
-}
-
-function syncCatchUp_() {
-  initTables_();
-  const accounts = listStravaAccounts_().filter(a => isTruthy_(a.connected));
-  accounts.forEach(a => syncUserActivities_(a.userId, { incremental: true, maxPages: 3 }));
-}
-
-function syncUserActivities_(userId, opts) {
-  opts = opts || {};
-  const acct = getStravaAccountByUserId_(userId);
-  if (!acct || !isTruthy_(acct.connected)) return;
-
-  let page = Number(acct.backfillPage || 1);
-  const maxPages = Number(opts.maxPages || 10);
-  let after = opts.incremental ? Number(acct.lastSyncAfter || 0) : 0;
-  if (opts.fullBackfill) {
-    page = 1;
-    after = 0;
+  function init(){
+    wireBottomNav();
+    wireModal();
+    wireTopbar();
+    wireAuth();
+    wirePlanTools();
+    checkAuthAndStart();
   }
 
-  let processed = 0;
-  let newest = Number(acct.lastSyncAfter || 0);
-
-  for (let i = 0; i < maxPages; i++) {
-    const rows = stravaListActivities_(userId, page, 200, after, null);
-    if (!rows || !rows.length) {
-      setBackfillState_(userId, page, true, newest);
-      break;
-    }
-    rows.forEach(a => {
-      upsertActivityFromStrava_(userId, Number(acct.stravaAthleteId || 0), a, false);
-      upsertLogFromStravaActivity_(userId, a);
-      const st = toEpochSec_(a.start_date || a.start_date_local);
-      if (st > newest) newest = st;
-      processed++;
+  function wireTopbar(){
+    el('refreshBtn').addEventListener('click', () => bootstrapAll(true));
+  el('connectStravaBtn').addEventListener('click', async () => {
+      try {
+        if (state.auth.strava?.connected) {
+          await apiCall('apiDisconnectStrava', {});
+          state.auth.strava = { connected:false };
+          updateStravaButton();
+          toast('Strava disconnected');
+          return;
+        }
+        const res = await apiCall('apiGetStravaConnectUrl', {});
+        if (res?.url) {
+          const win = window.open(res.url, '_blank', 'noopener,noreferrer');
+          if (!win) window.location.href = res.url;
+        }
+      } catch(err){
+        console.error(err);
+         toast(err && err.message ? `Strava connect failed: ${err.message}` : 'Unable to start Strava connect');
+      }
     });
-    page += 1;
   }
 
-  if (processed > 0) setBackfillState_(userId, page, false, newest);
-}
-
-function upsertActivityFromStrava_(userId, athleteId, activity, deletedFlag) {
-  initTables_();
-  const sh = getSheet_('Activities');
-  const data = sh.getDataRange().getValues();
-  const h = headerMap_(data[0]);
-  const id = String(activity.id || activity.object_id || '');
-  if (!id) return;
-
-  const rowObj = {
-    stravaActivityId: id,
-    userId,
-    athleteId: athleteId || Number((activity.athlete || {}).id || 0),
-    startDate: activity.start_date || activity.start_date_local || '',
-    type: activity.type || '',
-    name: activity.name || '',
-    distanceM: Number(activity.distance || 0),
-    movingTimeS: Number(activity.moving_time || 0),
-    elapsedTimeS: Number(activity.elapsed_time || 0),
-    totalElevationGainM: Number(activity.total_elevation_gain || 0),
-    averageHeartrate: Number(activity.average_heartrate || 0),
-    maxHeartrate: Number(activity.max_heartrate || 0),
-    averageSpeed: Number(activity.average_speed || 0),
-    summaryPolyline: ((activity.map || {}).summary_polyline || ''),
-    rawJson: JSON.stringify(activity).slice(0, 45000),
-    deleted: !!deletedFlag,
-    updatedAt: new Date()
-  };
-
-  let found = -1;
-  for (let r = 1; r < data.length; r++) {
-    if (String(data[r][h.stravaActivityId] || '') === id) { found = r + 1; break; }
+  function wireBottomNav(){
+    document.querySelectorAll('.nav-item').forEach(btn => {
+      btn.addEventListener('click', () => switchView(btn.dataset.view));
+    });
   }
 
-  const vals = ACTIVITY_HEADERS_.map(k => rowObj[k] == null ? '' : rowObj[k]);
-  if (found < 0) sh.appendRow(vals);
-  else sh.getRange(found, 1, 1, vals.length).setValues([vals]);
-}
+  function switchView(view){
+    state.currentView = view;
 
-function upsertLogFromStravaActivity_(userId, activity) {
-  const match = matchPlanForActivity_(activity);
-  const km = Number(activity.distance || 0) / 1000;
-  const min = Math.round(Number(activity.moving_time || 0) / 60);
-  upsertLog_({
-    PlanID: match.planId,
-    Status: 'DONE',
-    ActualKm: km,
-    ActualMin: min,
-    CompletedAt: new Date(activity.start_date || activity.start_date_local || new Date()),
-    LogNotes: 'Imported from Strava: ' + String(activity.name || 'Activity'),
-    UserId: userId,
-    Source: 'strava',
-    StravaActivityId: String(activity.id || ''),
-    SportType: String(activity.type || ''),
-    ImportedAt: new Date(),
-    PlanMatchConfidence: match.confidence,
-    PlanMatchReason: match.reason
-  });
-}
+    document.querySelectorAll('.nav-item').forEach(b => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
 
-function matchPlanForActivity_(activity) {
-  const settings = getSettings_();
-  const tz = settings.Timezone || Session.getScriptTimeZone();
-  const dateISO = toIsoDate_(activity.start_date_local || activity.start_date, tz);
-  if (!dateISO) return { planId: 'UNPLANNED', confidence: 0, reason: 'no_date' };
+    el('view-today').classList.toggle('hidden', view !== 'today');
+    el('view-plan').classList.toggle('hidden', view !== 'plan');
+    el('view-activities').classList.toggle('hidden', view !== 'activities');
+    el('view-stats').classList.toggle('hidden', view !== 'stats');
 
-  const candidates = readPlanBetween_(dateISO, dateISO, tz);
-  if (!candidates.length) return { planId: 'UNPLANNED', confidence: 0, reason: 'no_plan_on_date' };
-
-  const type = String(activity.type || '').toLowerCase();
-  const bySport = candidates.filter(c => String(c.Sport || '').toLowerCase().includes(type) || type.includes(String(c.Sport || '').toLowerCase()));
-  if (bySport.length) return { planId: bySport[0].PlanID, confidence: 0.9, reason: 'same_day_sport' };
-  return { planId: candidates[0].PlanID, confidence: 0.5, reason: 'same_day_nearest' };
-}
-
-function getStravaConnectionStatus_(userId) {
-  const acct = getStravaAccountByUserId_(userId);
-  if (!acct) return { connected: false };
-  return {
-    connected: isTruthy_(acct.connected),
-    athleteId: acct.stravaAthleteId || '',
-    expiresAt: acct.expiresAt || '',
-    scope: acct.scope || ''
-  };
-}
-
-function upsertStravaAccount_(userId, tokenResp) {
-  initTables_();
-  const athleteId = Number(((tokenResp.athlete || {}).id) || tokenResp.athlete_id || 0);
-  const rowObj = {
-    userId,
-    stravaAthleteId: athleteId,
-    accessToken: tokenResp.access_token,
-    refreshToken: tokenResp.refresh_token,
-    expiresAt: Number(tokenResp.expires_at || 0),
-    scope: tokenResp.scope || '',
-    connected: true,
-    lastSyncAfter: 0,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    backfillPage: 1,
-    backfillDone: false
-  };
-
-  const sh = getSheet_('StravaAccounts');
-  const data = sh.getDataRange().getValues();
-  const h = headerMap_(data[0]);
-  let found = -1;
-  for (let r = 1; r < data.length; r++) {
-    if (String(data[r][h.userId] || '') === String(userId)) { found = r + 1; break; }
+    renderActive();
   }
-  const vals = STRAVA_ACCOUNT_HEADERS_.map(k => rowObj[k] == null ? '' : rowObj[k]);
-  if (found < 0) sh.appendRow(vals);
-  else sh.getRange(found, 1, 1, vals.length).setValues([vals]);
-}
 
-function setStravaConnected_(userId, connected) {
-  const sh = getSheet_('StravaAccounts');
-  const data = sh.getDataRange().getValues();
-  if (data.length < 2) return;
-  const h = headerMap_(data[0]);
-  for (let r = 1; r < data.length; r++) {
-    if (String(data[r][h.userId] || '') === String(userId)) {
-      sh.getRange(r + 1, h.connected + 1).setValue(!!connected);
-      sh.getRange(r + 1, h.updatedAt + 1).setValue(new Date());
-      return;
+  function setSubtitle(text){
+    el('subTitle').textContent = text;
+  }
+
+  function toast(msg){
+    const t = el('toast');
+    t.textContent = msg;
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 1600);
+  }
+
+   
+  async function checkAuthAndStart(){
+    try {
+      const res = await callRaw('apiGetAuthState', { sessionToken: state.auth.sessionToken });
+      state.auth.needsSetup = !!res.needsSetup;
+      if (!res.authenticated) {
+        showAuthOverlay(res.needsSetup);
+        return;
+      }
+      state.auth.user = res.user;
+      state.auth.strava = res.strava || { connected:false };
+      el('appTitle').textContent = `Training Planner${res.user?.displayName ? ' • ' + res.user.displayName : ''}`;
+      updateStravaButton();
+      hideAuthOverlay();
+      bootstrapAll();
+    } catch (err) {
+      console.error(err);
+      showAuthOverlay(false);
     }
   }
-}
 
-function setBackfillState_(userId, page, done, lastSyncAfter) {
-  const sh = getSheet_('StravaAccounts');
-  const data = sh.getDataRange().getValues();
-  if (data.length < 2) return;
-  const h = headerMap_(data[0]);
-  for (let r = 1; r < data.length; r++) {
-    if (String(data[r][h.userId] || '') === String(userId)) {
-      writeIfHeader_(sh, r + 1, h, 'backfillPage', page);
-      writeIfHeader_(sh, r + 1, h, 'backfillDone', !!done);
-      writeIfHeader_(sh, r + 1, h, 'lastSyncAfter', Number(lastSyncAfter || 0));
-      writeIfHeader_(sh, r + 1, h, 'updatedAt', new Date());
+  function wireAuth(){
+    el('authSubmitBtn').addEventListener('click', async () => {
+      const payload = {
+        email: el('authEmail').value,
+        password: el('authPassword').value,
+        displayName: el('authDisplayName').value
+      };
+      try {
+        const res = state.auth.needsSetup
+          ? await callRaw('apiCreateAdmin', payload)
+          : await callRaw('apiLogin', payload);
+        state.auth.sessionToken = res.sessionToken;
+        localStorage.setItem('sessionToken', state.auth.sessionToken);
+        hideAuthOverlay();
+        await checkAuthAndStart();
+      } catch (err) {
+        toast('Login failed');
+      }
+    });
+  }
+
+  function showAuthOverlay(needsSetup){
+    state.auth.needsSetup = !!needsSetup;
+    el('authTitle').textContent = needsSetup ? 'Create Admin' : 'Login';
+    el('authMeta').textContent = needsSetup ? 'First run setup' : 'Sign in to continue';
+    el('authNameLabel').classList.toggle('hidden', !needsSetup);
+    el('authDisplayName').classList.toggle('hidden', !needsSetup);
+    el('authOverlay').classList.remove('hidden');
+  }
+
+  function hideAuthOverlay(){ el('authOverlay').classList.add('hidden'); }
+
+  function updateStravaButton(){
+    const b = el('connectStravaBtn');
+    const connected = !!state.auth.strava?.connected;
+    b.textContent = connected ? 'Disconnect Strava' : 'Connect Strava';
+  }
+
+
+  function wirePlanTools(){
+    el('planImportCloseBtn').addEventListener('click', closePlanImportModal);
+    el('planGenerateCloseBtn').addEventListener('click', closePlanGenerateModal);
+    el('planImportOverlay').addEventListener('click', (e) => { if (e.target === el('planImportOverlay')) closePlanImportModal(); });
+    el('planGenerateOverlay').addEventListener('click', (e) => { if (e.target === el('planGenerateOverlay')) closePlanGenerateModal(); });
+
+    el('planImportPreviewBtn').addEventListener('click', async () => {
+      try {
+        const file = el('planImportFile').files?.[0];
+        if (!file) { toast('Pick a CSV file first'); return; }
+        const text = await file.text();
+        const parsed = parseCsvText(text);
+        state.planImport.headers = parsed.headers;
+        state.planImport.rows = parsed.rows;
+
+        const preview = await apiCall('planImportPreview', {
+          headers: parsed.headers,
+          rows: parsed.rows
+        });
+        state.planImport.preview = preview;
+        renderPlanImportPreview(preview);
+        el('planImportCommitBtn').disabled = !!preview.criticalErrorCount;
+      } catch (err) {
+        console.error(err);
+        toast('Preview failed');
+      }
+    });
+
+    el('planImportCommitBtn').addEventListener('click', async () => {
+      try {
+        if (!state.planImport.preview) { toast('Run preview first'); return; }
+        const res = await apiCall('planImportCommit', {
+          headers: state.planImport.headers,
+          rows: state.planImport.rows
+        });
+        toast(`Imported ${res.total} rows (${res.inserted} new, ${res.updated} updated)`);
+        closePlanImportModal();
+        bootstrapAll(true);
+      } catch (err) {
+        console.error(err);
+        toast('Import failed');
+      }
+    });
+
+    el('planGenerateCommitBtn').addEventListener('click', async () => {
+      try {
+        const payload = {
+          planName: el('genPlanName').value,
+          targetDistanceKm: Number(el('genTargetKm').value || 10),
+          planLengthWeeks: Number(el('genLengthWeeks').value || 12),
+          trainingDaysPerWeek: Number(el('genDaysPerWeek').value || 4),
+          longRunDay: el('genLongRunDay').value,
+          startDate: el('genStartDate').value || '',
+          includeIntervals: !!el('genIncludeIntervals').checked,
+          includeTempo: !!el('genIncludeTempo').checked
+        };
+        const res = await apiCall('planGenerateCommit', payload);
+        el('planGenerateSummary').textContent = `Generated ${res.total} rows (${res.inserted} new, ${res.updated} updated), PlanID ${res.planId}`;
+        toast('Plan generated');
+        bootstrapAll(true);
+      } catch (err) {
+        console.error(err);
+        toast('Generate failed');
+      }
+    });
+  }
+
+  function openPlanImportModal(){
+    el('planImportOverlay').classList.remove('hidden');
+    el('planImportSummary').textContent = 'Upload CSV and click Preview.';
+    el('planImportPreviewWrap').innerHTML = '';
+    el('planImportCommitBtn').disabled = true;
+  }
+  function closePlanImportModal(){ el('planImportOverlay').classList.add('hidden'); }
+  function openPlanGenerateModal(){
+    el('planGenerateOverlay').classList.remove('hidden');
+    el('planGenerateSummary').textContent = '';
+  }
+  function closePlanGenerateModal(){ el('planGenerateOverlay').classList.add('hidden'); }
+
+  function renderPlanImportPreview(preview){
+    const warnCount = (preview.issues || []).reduce((a,it)=>a+(it.warnings||[]).length,0);
+    const errCount = Number(preview.criticalErrorCount || 0);
+    el('planImportSummary').innerHTML = `Rows: ${(preview.normalizedRows||[]).length} • <span class="chip-warn">Warnings: ${warnCount}</span> • <span class="chip-err">Errors: ${errCount}</span>`;
+
+    const sample = preview.sample || [];
+    if (!sample.length) {
+      el('planImportPreviewWrap').innerHTML = '<div class="hero-sub">No rows parsed.</div>';
       return;
     }
+
+    const cols = ['PlanID','PlanName','Date','SportType','WorkoutType','PlannedKm','PlannedMin','Notes'];
+    const table = `
+      <table class="preview-table">
+        <thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+        <tbody>
+          ${sample.map(r => `<tr>${cols.map(c => `<td>${esc(r[c] ?? '')}</td>`).join('')}</tr>`).join('')}
+        </tbody>
+      </table>`;
+
+    const issueTop = (preview.issues || []).filter(it => (it.warnings?.length || it.errors?.length)).slice(0, 8)
+      .map(it => `<div class="hero-sub">Row ${it.rowNumber}: ${(it.errors||[]).join('; ')} ${(it.warnings||[]).join('; ')}</div>`).join('');
+
+    el('planImportPreviewWrap').innerHTML = table + (issueTop ? `<div style="margin-top:8px;">${issueTop}</div>` : '');
   }
-}
 
-function getStravaAccountByUserId_(userId) {
-  return listStravaAccounts_().find(a => String(a.userId) === String(userId)) || null;
-}
-
-function getStravaAccountByAthleteId_(athleteId) {
-  return listStravaAccounts_().find(a => String(a.stravaAthleteId) === String(athleteId)) || null;
-}
-
-function listStravaAccounts_() {
-  const data = getSheet_('StravaAccounts').getDataRange().getValues();
-  if (data.length < 2) return [];
-  const h = headerMap_(data[0]);
-  return data.slice(1).filter(r => String(r[h.userId] || '').trim()).map(r => rowToObj_(h, r));
-}
-
-function signState_(payload) {
-  const body = Utilities.base64EncodeWebSafe(JSON.stringify(payload));
-  const secret = String(PropertiesService.getScriptProperties().getProperty('AUTH_SALT') || 'change-me');
-  const sigBytes = Utilities.computeHmacSha256Signature(body, secret);
-  const sig = Utilities.base64EncodeWebSafe(sigBytes);
-  return body + '.' + sig;
-}
-
-function parseSignedState_(state) {
-  const [body, sig] = String(state || '').split('.');
-  if (!body || !sig) throw new Error('Invalid OAuth state');
-  const secret = String(PropertiesService.getScriptProperties().getProperty('AUTH_SALT') || 'change-me');
-  const expected = Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(body, secret));
-  if (expected !== sig) throw new Error('State signature mismatch');
-  const payload = JSON.parse(Utilities.newBlob(Utilities.base64DecodeWebSafe(body)).getDataAsString());
-  if (Date.now() - Number(payload.ts || 0) > 15 * 60 * 1000) throw new Error('State expired');
-  return payload;
-}
-
-function toQuery_(obj) {
-  return Object.keys(obj).filter(k => obj[k] !== '' && obj[k] != null).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(obj[k]))).join('&');
-}
-
-function toEpochSec_(iso) {
-  if (!iso) return 0;
-  const d = new Date(iso);
-  return Math.floor(d.getTime() / 1000);
-}
-
-function escHtml_(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
-
-function installStravaTriggers_() {
-  const fnNames = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
-  if (!fnNames.includes('processWebhookQueue_')) {
-    ScriptApp.newTrigger('processWebhookQueue_').timeBased().everyMinutes(5).create();
+  function parseCsvText(text){
+    const rows = [];
+    let cur = '';
+    let row = [];
+    let inQ = false;
+    for (let i=0;i<text.length;i++) {
+      const ch = text[i];
+      const nxt = text[i+1];
+      if (ch === '"') {
+        if (inQ && nxt === '"') { cur += '"'; i++; }
+        else inQ = !inQ;
+      } else if (ch === ',' && !inQ) {
+        row.push(cur.trim());
+        cur = '';
+      } else if ((ch === '\n' || ch === '\r') && !inQ) {
+        if (ch === '\r' && nxt === '\n') i++;
+        row.push(cur.trim());
+        if (row.some(v => v !== '')) rows.push(row);
+        row = [];
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.length || row.length) {
+      row.push(cur.trim());
+      if (row.some(v => v !== '')) rows.push(row);
+    }
+    const headers = rows.length ? rows[0] : [];
+    return { headers, rows: rows.slice(1) };
   }
-  if (!fnNames.includes('syncCatchUp_')) {
-    ScriptApp.newTrigger('syncCatchUp_').timeBased().everyHours(1).create();
-  }
-}
 
-function setupInstructions_() {
-  return [
-    'Setup steps:',
-    '1) In Script Properties set STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN, WEBAPP_BASE_URL, AUTH_SALT.',
-    '2) Deploy web app and set WEBAPP_BASE_URL to that deployment URL.',
-    '3) Configure Strava app callback URL: WEBAPP_BASE_URL?route=stravaCallback.',
-    '4) Create Strava webhook subscription pointing to WEBAPP_BASE_URL (same endpoint).',
-    '5) Run initTables_() and installStravaTriggers_() once as admin.'
-  ].join('\n');
-}
+
+/** -------------------------
+   * Bootstrap
+   * ------------------------*/
+  async function bootstrapAll(force){
+    setSubtitle('Loading…');
+
+    // Load rolling first (drives Today + Plan)
+    google.script.run
+      .withSuccessHandler(res => {
+        state.settings = res.settings;
+        state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
+
+        setSubtitle('Your training week');
+
+        apiCall('apiListPlan', {})
+          .then(planRes => {
+            state.planItems = planRes?.items || [];
+            renderActive();
+          })
+          .catch(err => console.error(err));
+
+        // Load week + stats in background (non-blocking)
+        bootstrapWeek(todayIsoLocal());
+        bootstrapStats();
+
+        renderActive();
+      })
+      .withFailureHandler(err => {
+        console.error(err);
+        setSubtitle('Load failed');
+        toast('Load failed');
+      })
+      .apiBootstrap(withSession({}));
+  }
+
+  function bootstrapWeek(anchorDate){
+    const anchor = anchorDate || state.weekAnchorDate || todayIsoLocal();
+    google.script.run
+      .withSuccessHandler(res => {
+        state.week = { weekStart: res.weekStart, weekEnd: res.weekEnd, items: res.items, totals: res.totals };
+        state.weekAnchorDate = res.weekStart || anchor;
+        if (state.currentView === 'plan' || state.currentView === 'today') renderActive();
+      })
+      .withFailureHandler(err => console.error(err))
+      .apiComputeWeek(withSession({ anchorDate: anchor }));
+  }
+
+  function changeWeek(offset){
+    const base = state.week?.weekStart || todayIsoLocal();
+    const d = new Date(base + 'T00:00:00');
+    d.setDate(d.getDate() + (Number(offset) * 7));
+    bootstrapWeek(localDateISO(d));
+  }
+
+  function bootstrapStats(){
+     const today = todayIsoLocal();
+    const from = new Date();
+    from.setDate(from.getDate()-30);
+    const dateFrom = localDateISO(from);
+
+    google.script.run
+      .withSuccessHandler(res => {
+        state.stats = res;
+        if (state.currentView === 'stats' || state.currentView === 'today') renderActive();
+      })
+      .withFailureHandler(err => console.error(err))
+       .apiComputeStats(withSession({ dateFrom, dateTo: today }));
+  }
+
+  /** -------------------------
+   * Render dispatcher
+   * ------------------------*/
+  function renderActive(){
+    if (state.currentView === 'today') renderToday();
+    if (state.currentView === 'plan') renderPlan();
+    if (state.currentView === 'activities') renderActivities();
+    if (state.currentView === 'stats') renderStats();
+  }
+
+  /** -------------------------
+   * View: Today
+   * ------------------------*/
+  function renderToday(){
+     const root = el('view-today');
+    const todayISO = todayIsoLocal();
+
+    const todayItems = state.rolling.items.filter(it => it.Date === todayISO);
+    const nextItems = state.rolling.items
+      .filter(it => it.Date > todayISO)
+      .sort((a,b) => (a.Date.localeCompare(b.Date) || (a.Slot||'').localeCompare(b.Slot||'')))
+      .slice(0, 6);
+
+    // Week progress (if week data loaded)
+    const wk = state.week?.items || [];
+    const wkPlanned = wk.length;
+    const wkDone = wk.filter(it => it.Log && (it.Log.Status === 'DONE' || it.Log.Status === 'PARTIAL')).length;
+    const pct = wkPlanned ? Math.round((wkDone / wkPlanned) * 100) : 0;
+
+    root.innerHTML = `
+      <div class="hero">
+        <div class="hero-top">
+          <div>
+            <div class="hero-title">Week</div>
+           <div class="hero-sub">${formatDateShort(todayISO)} • ${todayItems.length} session(s)</div>
+          </div>
+         <div class="hero-sub">${state.week?.weekStart ? `Week ${formatDateShort(state.week.weekStart)} → ${formatDateShort(state.week.weekEnd)}` : ''}</div>
+        </div>
+
+        <div class="bar"><div style="width:${pct}%"></div></div>
+
+        <div class="hero-kpis">
+          <div class="kpi"><div class="k">Week progress</div><div class="v">${wkDone}/${wkPlanned || 0}</div></div>
+          <div class="kpi"><div class="k">Planned km (week)</div><div class="v">${fmt1(state.week?.totals?.plannedKm || 0)}</div></div>
+          <div class="kpi"><div class="k">Done km (week)</div><div class="v">${fmt1(state.week?.totals?.doneKm || 0)}</div></div>
+        </div>
+      </div>
+
+      <div class="section-title">Today sessions</div>
+      ${renderSessionCardBlock(todayItems, { showEmpty: true, allowDone: true })}
+
+      <div class="section-title">Up next</div>
+       ${renderSessionCardBlock(nextItems, { showEmpty: false, showDate: true, actions: 'none' })}
+
+       <div class="section-title">Add activity</div>
+      <div class="tile-grid">
+        <div class="tile run" data-add="run"><small>Add</small>Run</div>
+        <div class="tile swim" data-add="swim"><small>Add</small>Swim</div>
+        <div class="tile bike" data-add="bike"><small>Add</small>Bike</div>
+        <div class="tile workout" data-add="workout"><small>Add</small>Workout</div>
+      </div>
+
+      <div class="section-title">Streaks</div>
+      ${renderStreakMini()}
+    `;
+
+    wireSessions(root);
+    wireAddTiles(root);
+  }
+
+  function renderStreakMini(){
+    const s = state.stats;
+    const a = s?.streaks?.allPlannedCompleted ?? 0;
+    const b = s?.streaks?.didSomething ?? 0;
+    const allowance = Number(s?.settings?.PartialAllowancePerWeek ?? 1);
+
+    return `
+      <div class="card">
+        <div class="card-pad">
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 200px;">
+              <div class="k">All planned completed</div>
+              <div class="v">${a}</div>
+              <div class="hero-sub">Allows ${allowance} partial/week</div>
+            </div>
+            <div class="kpi" style="flex:1 1 200px;">
+              <div class="k">Did something</div>
+              <div class="v">${b}</div>
+              <div class="hero-sub">Any done/partial</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  /** -------------------------
+   * View: Plan (All sessions)
+   * ------------------------*/
+  function renderPlan(){
+    const root = el('view-plan');
+
+    const items = (state.planItems || []).slice().sort((a,b) => (a.Date.localeCompare(b.Date) || (a.Slot||'').localeCompare(b.Slot||'')));
+    const grouped = groupByDateSlot(items);
+
+    const totals = state.week?.totals || computeTotalsClient(items);
+    const plannedCount = items.length;
+    const doneCount = items.filter(it => it.Log && (it.Log.Status === 'DONE' || it.Log.Status === 'PARTIAL')).length;
+    const pct = plannedCount ? Math.round((doneCount/plannedCount)*100) : 0;
+
+     const weekLabel = `${items.length} total session(s)`;
+
+    root.innerHTML = `
+       <div class="week-card">
+        <div class="week-top">
+          <div>
+            <div class="week-title">Plan</div>
+            <div class="week-meta">${weekLabel} • ${doneCount}/${plannedCount} done • ${fmt1(totals.plannedKm)} km planned</div>
+            <div class="bar"><div style="width:${pct}%"></div></div>
+          </div>
+             <div style="display:flex; gap:8px; align-items:center;">
+               <button class="btn ghost" data-action="add-activity" style="min-width:auto;">Add Activity</button>
+              <button class="btn ghost" data-action="open-import" style="min-width:auto;">Add Plan</button>
+            <button class="btn primary" data-action="open-generate" style="min-width:auto;">Create Plan</button>
+                      </div>
+        </div>
+
+        <div class="card" id="week1Body" style="margin-top:12px;">
+          ${Object.keys(grouped).sort().map(dateISO => {
+            const day = grouped[dateISO];
+            return `
+              <div class="card-pad" style="padding-bottom:0;">
+                <div class="section-title" style="margin:0 0 8px 0;">${formatDateWithDay(dateISO)}</div>
+              </div>
+              ${renderSlotList(dateISO, 'AM', day.AM)}
+              ${renderSlotList(dateISO, 'PM', day.PM)}
+            `;
+          }).join('')}
+        </div>
+      </div>
+    `;
+
+    wireSessions(root);
+    root.querySelector('[data-action="add-activity"]')?.addEventListener('click', () => {
+      toast('Add activity flow coming next');
+    });
+   root.querySelector('[data-action="open-import"]')?.addEventListener('click', openPlanImportModal);
+    root.querySelector('[data-action="open-generate"]')?.addEventListener('click', openPlanGenerateModal);
+  }
+
+  function renderSlotList(dateISO, slot, items){
+    items = items || [];
+    if (!items.length) return '';
+    return `
+      <div class="card-pad" style="padding-top:6px; padding-bottom:6px; border-top:1px solid rgba(255,255,255,.06);">
+        <div class="section-title" style="margin:0; font-size:12px;">${slot}</div>
+      </div>
+      ${items.map(it => renderSessionRow(it, { allowDone:false })).join('')}
+    `;
+  }
+
+
+  /** -------------------------
+   * View: Activities (completed feed)
+   * ------------------------*/
+  function renderActivities(){
+    const root = el('view-activities');
+
+    // Activities = any item with log status DONE/PARTIAL/SKIPPED
+     const all = (state.planItems || []).slice();
+    const done = all
+      .filter(it => it.Log && it.Log.Status && it.Log.Status !== 'PLANNED')
+      .sort((a,b) => (b.Date.localeCompare(a.Date)));
+
+    root.innerHTML = `
+      <div class="section-title">Activities</div>
+      <div class="card">
+          ${done.length ? done.map(it => renderSessionRow(it, { showDate:true, allowDone:false })).join('') :
+          `<div class="card-pad"><div class="hero-sub">No completed sessions yet. Mark something done.</div></div>`
+        }
+      </div>
+    `;
+
+    wireSessions(root);
+  }
+
+  /** -------------------------
+   * View: Stats (full)
+   * ------------------------*/
+  function renderStats(){
+    const root = el('view-stats');
+    const res = state.stats;
+
+    const s1 = res?.streaks?.allPlannedCompleted ?? 0;
+    const s2 = res?.streaks?.didSomething ?? 0;
+    const allowance = Number(res?.settings?.PartialAllowancePerWeek ?? 1);
+
+    root.innerHTML = `
+      <div class="section-title">Stats</div>
+
+      <div class="card">
+        <div class="card-pad">
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Streak: all planned</div>
+              <div class="v">${s1}</div>
+              <div class="hero-sub">Allows ${allowance} partial/week</div>
+            </div>
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Streak: did something</div>
+              <div class="v">${s2}</div>
+              <div class="hero-sub">Any done/partial with actuals</div>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Km this month</div>
+              <div class="v">${fmt1(res?.kmSummary?.monthDoneKm || 0)}</div>
+            </div>
+            <div class="kpi" style="flex:1 1 220px;">
+              <div class="k">Km this year</div>
+              <div class="v">${fmt1(res?.kmSummary?.yearDoneKm || 0)}</div>
+      </div>
+      </div>
+        </div>
+      </div>
+    `;
+  }
+
+  /** -------------------------
+   * Session rendering
+   * ------------------------*/
+  function renderSessionCardBlock(items, options){
+    const showEmpty = !!options?.showEmpty;
+    const showDate = !!options?.showDate;
+    const allowDone = options?.allowDone !== false;
+    const actions = options?.actions || 'default';
+    if (!items || !items.length){
+      return showEmpty ? `<div class="card"><div class="card-pad"><div class="hero-sub">No sessions.</div></div></div>` : '';
+    }
+    return `
+      <div class="card">
+          ${items.map(it => renderSessionRow(it, { showDate, allowDone, actions })).join('')}
+      </div>
+    `;
+  }
+
+  function renderSessionRow(it, options){
+    options = (options && typeof options === "object") ? options : {};
+    const showDate = !!options?.showDate;
+    const allowDone = options?.allowDone !== false;
+    const actions = options?.actions || 'default';
+    const log = it.Log || null;
+    const status = log?.Status || 'PLANNED';
+
+    const color = workoutColor(it);
+    const planned = plannedText(it);
+    const actual = log ? actualText(log) : '';
+
+    let rightBtn = '';
+    if (actions !== 'none') {
+      rightBtn = (status === 'DONE' || status === 'PARTIAL' || status === 'SKIPPED' || !allowDone)
+        ? `<button class="btn ghost" data-action="edit" data-planid="${esc(it.PlanID)}">Edit</button>`
+        : `<button class="btn primary" data-action="done" data-planid="${esc(it.PlanID)}">Done</button>`;
+    }
+
+    const dateLine = showDate ? `${formatDateWithDay(it.Date)} • ` : '';
+    const sub = `${dateLine}${it.Slot || ''} • ${it.Sport || 'Other'} • ${planned}${it.RPE ? ` • RPE ${esc(String(it.RPE))}` : ''}`;
+
+    return `
+      <div class="session" data-planid="${esc(it.PlanID)}">
+        <div class="dot" style="background:${color};"></div>
+        <div class="session-main">
+          <div class="session-title">${esc(it.Title || '(Untitled)')}</div>
+          <div class="session-sub">${esc(sub)}</div>
+          ${it.Notes ? `<div class="session-note">${esc(it.Notes)}</div>` : ''}
+          ${actual ? `<div class="session-note">Actual: ${esc(actual)}</div>` : ''}
+        </div>
+        <div class="session-actions">
+          ${rightBtn}
+        </div>
+      </div>
+    `;
+  }
+
+  function wireSessions(root){
+    // done buttons
+    root.querySelectorAll('button[data-action="done"]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const planId = e.currentTarget.dataset.planid;
+        e.currentTarget.disabled = true;
+        try{
+          const log = await callApiSetDone({ planId });
+          patchItemLog(planId, log);
+          toast('Marked done');
+         bootstrapWeek(todayIsoLocal());   // refresh totals
+          bootstrapStats();  // refresh streaks
+          renderActive();
+        }catch(err){
+          console.error(err);
+          toast('Failed');
+        }finally{
+          e.currentTarget.disabled = false;
+        }
+      });
+    });
+
+    // edit buttons
+    root.querySelectorAll('button[data-action="edit"]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const planId = e.currentTarget.dataset.planid;
+        const item = findItem(planId);
+        if (item) openModal(item);
+      });
+    });
+
+    // tap row to edit
+    root.querySelectorAll('.session').forEach(row => {
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('button')) return;
+        const planId = row.dataset.planid;
+        const item = findItem(planId);
+        if (item) openModal(item);
+      });
+    });
+  }
+
+  function wireAddTiles(root){
+    root.querySelectorAll('[data-add]').forEach(tile => {
+      tile.addEventListener('click', () => {
+        const activity = tile.dataset.add;
+        toast(`Add ${activity} activity (next step)`);
+        // v1.1: open "create planned session" modal and write to Plan
+      });
+    });
+  }
+
+  /** -------------------------
+   * Modal
+   * ------------------------*/
+  function wireModal(){
+    el('modalCloseBtn').addEventListener('click', closeModal);
+    el('modalCancelBtn').addEventListener('click', closeModal);
+    el('modalOverlay').addEventListener('click', (e) => {
+      if (e.target === el('modalOverlay')) closeModal();
+    });
+
+    el('modalSaveBtn').addEventListener('click', async () => {
+      const item = state.modal.item;
+      if (!item) return;
+
+      const payload = {
+        planId: item.PlanID,
+        status: el('editStatus').value,
+        actualKm: el('editKm').value,
+        actualMin: el('editMin').value,
+        notes: el('editNotes').value
+      };
+
+      el('modalSaveBtn').disabled = true;
+      try{
+        const log = await callApiUpdateLog(payload);
+        patchItemLog(item.PlanID, log);
+        toast('Updated');
+        closeModal();
+         bootstrapWeek(todayIsoLocal());
+        bootstrapStats();
+        renderActive();
+      }catch(err){
+        console.error(err);
+        toast('Save failed');
+      }finally{
+        el('modalSaveBtn').disabled = false;
+      }
+    });
+  }
+
+  function openModal(item){
+    state.modal.open = true;
+    state.modal.item = item;
+
+    el('modalTitle').textContent = item.Title || 'Edit session';
+    el('modalMeta').textContent = `${formatDateShort(item.Date)} • ${item.Slot} • ${item.Sport || 'Other'}`;
+
+    const log = item.Log || null;
+
+    el('editStatus').value = (log?.Status || 'DONE');
+    el('editKm').value = (log?.ActualKm ?? item.PlannedKm ?? '');
+    el('editMin').value = (log?.ActualMin ?? item.PlannedMin ?? '');
+    el('editNotes').value = (log?.LogNotes ?? '');
+
+    el('modalOverlay').classList.remove('hidden');
+    el('modalOverlay').setAttribute('aria-hidden', 'false');
+  }
+
+  function closeModal(){
+    state.modal.open = false;
+    state.modal.item = null;
+    el('modalOverlay').classList.add('hidden');
+    el('modalOverlay').setAttribute('aria-hidden', 'true');
+  }
+
+  /** -------------------------
+   * Data helpers
+   * ------------------------*/
+  function groupByDateSlot(items){
+    const out = {};
+    (items || []).forEach(it => {
+      const d = it.Date;
+      if (!out[d]) out[d] = { AM: [], PM: [], count: 0 };
+      const slot = (it.Slot || 'AM').toUpperCase();
+      if (slot === 'PM') out[d].PM.push(it);
+      else out[d].AM.push(it);
+      out[d].count++;
+    });
+    // sort within slots
+    Object.keys(out).forEach(d => {
+      out[d].AM.sort(sortItem);
+      out[d].PM.sort(sortItem);
+    });
+    return out;
+  }
+
+  function sortItem(a,b){
+    return (String(a.Slot||'').localeCompare(String(b.Slot||'')) ||
+            String(a.Sport||'').localeCompare(String(b.Sport||'')) ||
+            String(a.Title||'').localeCompare(String(b.Title||'')));
+  }
+
+  function findItem(planId){
+    const pool = [...(state.planItems||[]), ...(state.rolling.items||[]), ...(state.week.items||[])];
+    return pool.find(x => x.PlanID === planId);
+  }
+
+  function patchItemLog(planId, log){
+    const patch = (arr) => {
+      const idx = arr.findIndex(x => x.PlanID === planId);
+      if (idx >= 0) arr[idx].Log = log || null;
+    };
+    patch(state.rolling.items);
+    patch(state.week.items || []);
+  }
+
+  function computeTotalsClient(items){
+    const t = { plannedKm:0, plannedMin:0, doneKm:0, doneMin:0 };
+    (items||[]).forEach(it => {
+      t.plannedKm += num(it.PlannedKm);
+      t.plannedMin += num(it.PlannedMin);
+      const log = it.Log;
+      if (log && (log.Status === 'DONE' || log.Status === 'PARTIAL')){
+        t.doneKm += num(log.ActualKm);
+        t.doneMin += num(log.ActualMin);
+      }
+    });
+    return t;
+  }
+
+  /** -------------------------
+   * Workout colour logic
+   * ------------------------*/
+  function workoutColor(it){
+    const sport = (it.Sport || '').toLowerCase();
+    const title = (it.Title || '').toLowerCase();
+
+    if (sport.includes('swim')) return 'var(--swim)';
+    if (sport.includes('bike') || sport.includes('cycle')) return 'var(--bike)';
+    if (sport.includes('gym')) return 'var(--gym)';
+    if (sport.includes('mob')) return 'var(--mob)';
+
+    // Running type by title keywords
+    if (title.includes('easy')) return 'var(--easy)';
+    if (title.includes('tempo')) return 'var(--tempo)';
+    if (title.includes('interval')) return 'var(--interval)';
+    if (title.includes('hill')) return 'var(--hills)';
+    if (title.includes('long') || title.includes('peak')) return 'var(--long)';
+    if (title.includes('race')) return 'var(--race)';
+
+    return 'rgba(255,255,255,.18)';
+  }
+
+  function plannedText(it){
+    const mode = String(it.MetricMode || 'BOTH').toUpperCase();
+    const km = num(it.PlannedKm);
+    const min = num(it.PlannedMin);
+
+    if (mode === 'KM') return `${fmt1(km)} km`;
+    if (mode === 'MIN') return `${fmt0(min)} min`;
+    const parts = [];
+    if (km) parts.push(`${fmt1(km)} km`);
+    if (min) parts.push(`${fmt0(min)} min`);
+    return parts.join(' • ') || '—';
+  }
+
+  function actualText(log){
+    const ak = num(log.ActualKm);
+    const am = num(log.ActualMin);
+    const parts = [];
+    if (ak) parts.push(`${fmt1(ak)} km`);
+    if (am) parts.push(`${fmt0(am)} min`);
+    return `${log.Status}: ${parts.join(' • ') || '—'}`;
+  }
+
+
+  function localDateISO(d){
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function todayIsoLocal(){
+    return localDateISO(new Date());
+  }
+
+function formatDateShort(dateISO){
+    if (!dateISO) return '';
+    const y = String(dateISO).slice(2,4);
+    const m = String(dateISO).slice(5,7);
+    const dNum = String(dateISO).slice(8,10);
+    return `${dNum}-${m}-${y}`;
+  }
+
+function formatDateWithDay(dateISO){
+    if (!dateISO) return '';
+    const d = new Date(dateISO + 'T00:00:00');
+    const day = d.toLocaleDateString('en-US', { weekday: 'short' });
+    return `${day} ${formatDateShort(dateISO)}`;
+  }
+
+  function fmt1(n){
+    const r = Math.round(n*10)/10;
+    return (Math.abs(r)%1===0) ? String(r.toFixed(0)) : String(r.toFixed(1));
+  }
+  function fmt0(n){ return String(Math.round(num(n))); }
+  function num(v){ const n = Number(v); return isNaN(n) ? 0 : n; }
+
+  function esc(s){
+    return String(s || '')
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'","&#039;");
+  }
+
+  /** -------------------------
+   * Server calls
+   * ------------------------*/
+ function withSession(payload){
+    return { ...(payload || {}), sessionToken: state.auth.sessionToken };
+  }
+
+  function callRaw(method, payload){
+    return new Promise((resolve, reject) => {
+   google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[method](payload || {});
+    });
+  }
+
+  async function apiCall(method, payload){
+    try {
+      return await callRaw(method, withSession(payload));
+    } catch (err) {
+      const msg = String(err && err.message || err || '');
+      if (msg.includes('Session expired') || msg.includes('Authentication required')) {
+        localStorage.removeItem('sessionToken');
+        state.auth.sessionToken = null;
+        showAuthOverlay(false);
+      }
+      throw err;
+    }
+  }
+
+  function callApiSetDone(payload){
+    return apiCall('apiSetDone', payload);
+  }
+
+  function callApiUpdateLog(payload){
+     return apiCall('apiUpdateLog', payload);
+  }
+
+  // boot
+  init();
+</script>
