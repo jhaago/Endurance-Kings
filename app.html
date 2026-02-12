@@ -25,6 +25,26 @@
 
   function wireTopbar(){
     el('refreshBtn').addEventListener('click', () => bootstrapAll(true));
+   el('resumeBackfillBtn').addEventListener('click', async () => {
+      try {
+        await apiCall('apiResumeStravaBackfill', {});
+        toast('Backfill resumed');
+        await refreshStravaStatus();
+      } catch (err) {
+        console.error(err);
+        toast('Unable to resume backfill');
+      }
+    });
+    el('restartBackfillBtn').addEventListener('click', async () => {
+      try {
+        await apiCall('apiRestartStravaBackfill', {});
+        toast('Backfill restarted');
+        await refreshStravaStatus();
+      } catch (err) {
+        console.error(err);
+        toast('Unable to restart backfill');
+      }
+    });
   el('connectStravaBtn').addEventListener('click', async () => {
       try {
         if (state.auth.strava?.connected) {
@@ -32,6 +52,7 @@
           state.auth.strava = { connected:false };
           updateStravaButton();
           toast('Strava disconnected');
+          await refreshStravaStatus();
           return;
         }
         const res = await apiCall('apiGetStravaConnectUrl', {});
@@ -135,6 +156,40 @@
     const b = el('connectStravaBtn');
     const connected = !!state.auth.strava?.connected;
     b.textContent = connected ? 'Disconnect Strava' : 'Connect Strava';
+  
+    const status = el('stravaStatusBadge');
+    const resumeBtn = el('resumeBackfillBtn');
+    const restartBtn = el('restartBackfillBtn');
+    if (!connected) {
+      status.classList.add('hidden');
+      status.textContent = '';
+      resumeBtn.classList.add('hidden');
+      restartBtn.classList.add('hidden');
+      return;
+    }
+
+    const done = !!state.auth.strava?.backfillDone;
+    const mode = state.auth.strava?.backfillMode || 'beforeCursor';
+    const page = Number(state.auth.strava?.backfillPage || 1);
+    const before = Number(state.auth.strava?.backfillBeforeEpoch || 0);
+    const cursorDate = before ? new Date(before * 1000).toISOString().slice(0, 10) : 'n/a';
+    status.classList.remove('hidden');
+    status.textContent = done
+      ? 'Backfill complete'
+      : `Backfill in progress: ${mode === 'page' ? `page ${page}` : `before ${cursorDate}`}`;
+    resumeBtn.classList.remove('hidden');
+    restartBtn.classList.remove('hidden');
+  }
+
+  async function refreshStravaStatus(){
+    if (!state.auth.sessionToken) return;
+    try {
+      const strava = await apiCall('apiGetStravaStatus', {});
+      state.auth.strava = strava || { connected:false };
+      updateStravaButton();
+    } catch (err) {
+      console.error(err);
+    }
   }
 
 
@@ -290,6 +345,7 @@
         state.rolling = { dateFrom: res.dateFrom, dateTo: res.dateTo, items: res.items };
 
         setSubtitle('Your training week');
+refreshStravaStatus();
 
         apiCall('apiListPlan', {})
           .then(planRes => {
@@ -402,10 +458,10 @@
 
        <div class="section-title">Add activity</div>
       <div class="tile-grid">
-        <div class="tile run" data-add="run"><small>Add</small>Run</div>
-        <div class="tile swim" data-add="swim"><small>Add</small>Swim</div>
-        <div class="tile bike" data-add="bike"><small>Add</small>Bike</div>
-        <div class="tile workout" data-add="workout"><small>Add</small>Workout</div>
+        <div class="tile run" data-add=" run"><small>Add</small>Run</div>
+        <div class="tile swim" data-add=" swim"><small>Add</small>Swim</div>
+        <div class="tile bike" data-add=" bike"><small>Add</small>Bike</div>
+        <div class="tile workout" data-add=" workout"><small>Add</small>Workout</div>
       </div>
 
       <div class="section-title">Streaks</div>
