@@ -104,7 +104,7 @@
    
   async function checkAuthAndStart(){
     try {
-      const res = await callRaw('apiGetAuthState', { sessionToken: state.auth.sessionToken });
+      const res = await callRaw('apiGetAuthState', { sessionToken: state.auth.sessionToken }) || {};
       state.auth.needsSetup = !!res.needsSetup;
       if (!res.authenticated) {
         showAuthOverlay(res.needsSetup);
@@ -133,7 +133,9 @@
         const res = state.auth.needsSetup
           ? await callRaw('apiCreateAdmin', payload)
           : await callRaw('apiLogin', payload);
-        state.auth.sessionToken = res.sessionToken;
+         const sessionToken = String(res && res.sessionToken || '').trim();
+        if (!sessionToken) throw new Error('Login response missing session token');
+        state.auth.sessionToken = sessionToken;
         localStorage.setItem('sessionToken', state.auth.sessionToken);
         hideAuthOverlay();
         hideResetPasswordPanel();
