@@ -381,7 +381,7 @@
 
       const [planRes, activitiesRes] = await Promise.all([
         apiCall('apiListPlan', {}),
-        apiCall('apiListActivities', { limit: 200 })
+        apiCall('apiListActivities', { limit: 1000 })
       ]);
       state.planItems = planRes?.items || [];
       state.activities.items = activitiesRes?.items || [];
@@ -687,18 +687,18 @@
 
                     <div style="display:flex; gap:12px; flex-wrap:wrap;">
             <div class="kpi" style="flex:1 1 220px;">
-              <div class="k">Km this month</div>
-              <div class="v">${fmt1(res?.kmSummary?.monthDoneKm || 0)}</div>
+              <div class="k">Km this month (plan • Strava)</div>
+              <div class="v">${fmt1(res?.kmSummary?.monthDoneKm || 0)} • ${fmt1(res?.kmSummary?.monthActivityKm || 0)}</div>
             </div>
             <div class="kpi" style="flex:1 1 220px;">
-              <div class="k">Km this year</div>
-              <div class="v">${fmt1(res?.kmSummary?.yearDoneKm || 0)}</div>
+               <div class="k">Km this year (plan • Strava)</div>
+              <div class="v">${fmt1(res?.kmSummary?.yearDoneKm || 0)} • ${fmt1(res?.kmSummary?.yearActivityKm || 0)}</div>
        </div>
           </div>
 
           <div style="margin-top:12px;">
             <div class="k" style="font-size:28px; color:var(--muted); font-weight:900;">Distance trend</div>
-            ${renderTrendChart(res?.distanceTrend || [], state.statsUi.granularity)}
+             ${renderTrendChart((res?.distanceTrend || []).length ? (res?.distanceTrend || []) : (res?.activityTrend || []), state.statsUi.granularity)}
           </div>
         </div>
       </div>
