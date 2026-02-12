@@ -151,7 +151,7 @@ function apiListPlan(args) {
 function apiListActivities(args) {
   args = args || {};
   const auth = requireSessionFromArgs_(args);
-  const limit = Math.max(1, Math.min(500, Number(args.limit || 200)));
+  const limit = Math.max(1, Math.min(5000, Number(args.limit || 1000)));
   const sh = getSheet_('Activities');
   const data = sh.getDataRange().getValues();
   if (data.length < 2) return { items: [] };
@@ -167,6 +167,28 @@ function apiListActivities(args) {
   return { items };
 }
 
+
+
+function readActivitiesBetween_(userId, dateFromISO, dateToISO) {
+  const sh = getSheet_('Activities');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return [];
+  const h = headerMap_(data[0]);
+
+  return data.slice(1)
+    .map(r => rowToObj_(h, r))
+    .filter(a => String(a.userId || '') === String(userId || ''))
+    .filter(a => String(a.deleted || '').toLowerCase() !== 'true')
+    .map(a => {
+      const dateISO = toIsoDate_(a.startDate, Session.getScriptTimeZone());
+      return {
+        dateISO,
+        km: Number(a.distanceM || 0) / 1000,
+        min: Math.round(Number(a.movingTimeS || 0) / 60)
+      };
+    })
+    .filter(a => a.dateISO && a.dateISO >= dateFromISO && a.dateISO <= dateToISO);
+}
 function apiComputeStats(args) {
   args = args || {};
   const settings = getSettings_();
@@ -254,6 +276,22 @@ const granularity = String(args.granularity || 'week').toLowerCase() === 'month'
 
 const distanceTrend = computeDistanceTrend_(items, weekStartsOn, tz, granularity);
 
+  // Activity-based fallback/augmentation for Strava-only workflows.
+  const activityRows = readActivitiesBetween_(auth.user.userId, yearStart, dateTo);
+  let monthActivityKm = 0;
+  let yearActivityKm = 0;
+  const activityTrendBuckets = {};
+  activityRows.forEach(a => {
+    yearActivityKm += a.km;
+    if (a.dateISO >= monthStart) monthActivityKm += a.km;
+    if (a.dateISO < dateFrom) return;
+    const key = granularity === 'month'
+      ? String(a.dateISO || '').slice(0, 7)
+      : weekRange_(a.dateISO, weekStartsOn, tz).weekStart;
+    activityTrendBuckets[key] = (activityTrendBuckets[key] || 0) + a.km;
+  });
+  const activityTrend = Object.keys(activityTrendBuckets).sort().map(k => ({ label: k, km: activityTrendBuckets[k] }));
+
   return {
     settings,
     dateFrom,
@@ -262,12 +300,15 @@ const distanceTrend = computeDistanceTrend_(items, weekStartsOn, tz, granularity
     streaks: {
       allPlannedCompleted: streakAllPlanned,
       didSomething: streakDidSomething
-       },
+    },
     kmSummary: {
       monthDoneKm,
-      yearDoneKm
-      },
-    distanceTrend
+      yearDoneKm,
+      monthActivityKm,
+      yearActivityKm
+    },
+    distanceTrend,
+    activityTrend
   };
 }
 
