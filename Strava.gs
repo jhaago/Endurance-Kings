@@ -19,12 +19,15 @@ function apiDisconnectStrava(args) {
 
 function apiGetStravaStatus(args) {
   const auth = requireSessionFromArgs_(args || {});
-  return getStravaConnectionStatus_(auth.user.userId);
+  const status = getStravaConnectionStatus_(auth.user.userId);
+  if (status.connected) installStravaTriggers_();
+  return status;
 }
 
 function apiResumeStravaBackfill(args) {
   const auth = requireSessionFromArgs_(args || {});
   const userId = resolveTargetUserId_(auth.user, args || {});
+  installStravaTriggers_();
   setBackfillState_(userId, {
     backfillDone: false,
     backfillLastRunAt: new Date(),
@@ -38,6 +41,7 @@ function apiResumeStravaBackfill(args) {
 function apiRestartStravaBackfill(args) {
   const auth = requireSessionFromArgs_(args || {});
   const userId = resolveTargetUserId_(auth.user, args || {});
+   installStravaTriggers_();
   restartStravaBackfill_(userId);
   installStravaBackfillTrigger_();
   stravaBackfillWorker_();
@@ -64,6 +68,7 @@ function handleStravaOAuthCallback_(e) {
     const tokenResp = exchangeStravaCode_(code);
     upsertStravaAccount_(userId, tokenResp);
     restartStravaBackfill_(userId);
+    installStravaTriggers_();
     installStravaBackfillTrigger_();
     stravaBackfillWorker_();
 
